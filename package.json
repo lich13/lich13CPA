@@ -6,6 +6,9 @@
   "description": "Minimal single-exe desktop shell for CLIProxyAPI with same-folder config, auth, and binary flow.",
   "main": "dist-electron/main.cjs",
   "type": "module",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
   "scripts": {
     "dev": "npm run build && electron .",
     "dev:live": "concurrently -k -n renderer,electron,app -c cyan,magenta,green \"npm:dev:renderer\" \"npm:dev:electron\" \"npm:dev:app\"",
@@ -18,7 +21,10 @@
     "build:renderer": "vite build",
     "prepare:win-binaries": "node scripts/prepare-win-binaries.mjs",
     "dist": "npm run dist:win",
-    "dist:mac": "npm run build && electron-builder --mac",
+    "dist:mac": "npm run dist:mac:zip",
+    "dist:mac:prepare": "node scripts/prepare-mac-build.mjs && npm run build",
+    "dist:mac:zip": "npm run dist:mac:prepare && electron-builder --mac zip --arm64 --publish never",
+    "dist:mac:dmg": "npm run dist:mac:prepare && electron-builder --mac dmg --arm64 --publish never",
     "dist:win": "npm run dist:win:prepare && npm run dist:win:pack:x64 && npm run dist:win:pack:arm64",
     "dist:win:prepare": "npm run prepare:win-binaries && npm run build:icon && npm run build",
     "dist:win:pack:x64": "electron-builder --win nsis --x64",
@@ -76,14 +82,6 @@
       {
         "from": "embedded-binaries",
         "to": "embedded-binaries"
-      },
-      {
-        "from": "build/icon.ico",
-        "to": "tray-assets/icon.ico"
-      },
-      {
-        "from": "build/icon.png",
-        "to": "tray-assets/icon.png"
       }
     ],
     "extraMetadata": {
@@ -92,6 +90,16 @@
     "win": {
       "icon": "build/icon.ico",
       "artifactName": "lich13CPA-${version}-win-${arch}-setup.${ext}",
+      "extraResources": [
+        {
+          "from": "build/icon.ico",
+          "to": "tray-assets/icon.ico"
+        },
+        {
+          "from": "build/icon.png",
+          "to": "tray-assets/icon.png"
+        }
+      ],
       "target": [
         {
           "target": "nsis",
@@ -107,6 +115,12 @@
       "extendInfo": {
         "LSUIElement": true
       },
+      "extraResources": [
+        {
+          "from": "build/icon.png",
+          "to": "tray-assets/icon.png"
+        }
+      ],
       "target": [
         {
           "target": "dmg",

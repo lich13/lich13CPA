@@ -70,13 +70,17 @@ function New-Point {
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 New-Item -ItemType Directory -Force -Path $publicDir | Out-Null
 
-$size = 256
+$baseSize = 256
+$size = 512
 $bitmap = New-Object System.Drawing.Bitmap($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
 $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
 $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
 $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
 $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
 $graphics.Clear([System.Drawing.Color]::Transparent)
+
+$scale = $size / $baseSize
+$graphics.ScaleTransform($scale, $scale)
 
 $shadowBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(56, 0, 0, 0))
 $graphics.FillEllipse($shadowBrush, 34, 198, 188, 24)

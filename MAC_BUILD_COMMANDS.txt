@@ -1,0 +1,92 @@
+﻿lich13CPA macOS Apple Silicon 编译指令
+======================================
+
+1. 环境要求
+- macOS Apple Silicon
+- 原生 arm64 终端
+- Node 20.19+ 或 22.12+，建议 Node 24 LTS arm64
+- npm 10+
+- Xcode Command Line Tools
+
+2. 安装基础工具
+```bash
+xcode-select --install
+```
+
+如需安装 nvm：
+```bash
+curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+source ~/.zshrc
+```
+
+安装并切到原生 arm64 Node 24：
+```bash
+nvm install 24
+nvm use 24
+node -p "process.version + ' / ' + process.arch"
+```
+
+输出里必须看到 `arm64`。如果是 `x64`，说明你当前在 Rosetta 里，不要继续打包。
+
+3. 进入项目目录
+```bash
+cd /path/to/lich13CPA
+```
+
+4. 给内嵌 mac 二进制补执行权限
+```bash
+chmod +x embedded-binaries/mac-arm64/cli-proxy-api
+```
+
+5. 安装依赖
+```bash
+npm ci
+```
+
+如果公司网络或证书环境导致 Electron 下载失败，可临时加镜像：
+```bash
+export ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/"
+export ELECTRON_BUILDER_BINARIES_MIRROR="https://npmmirror.com/mirrors/electron-builder-binaries/"
+npm ci
+```
+
+6. 生成 mac arm64 zip
+```bash
+npm run dist:mac
+```
+
+默认输出：
+- `release/lich13CPA-0.1.0-mac-arm64.zip`
+- `release/mac-arm64/lich13CPA.app`
+
+7. 额外生成 DMG
+```bash
+npm run dist:mac:dmg
+```
+
+如果 electron-builder 在下载 DMG 辅助工具阶段卡住，可直接用系统自带 `hdiutil` 从已经生成好的 `.app` 做一个简易 DMG：
+```bash
+rm -f release/lich13CPA-0.1.0-mac-arm64.dmg
+hdiutil create \
+  -volname "lich13CPA" \
+  -srcfolder "release/mac-arm64/lich13CPA.app" \
+  -ov \
+  -format UDZO \
+  "release/lich13CPA-0.1.0-mac-arm64.dmg"
+```
+
+8. 构建完成后的自检
+```bash
+codesign --verify --deep --strict "release/mac-arm64/lich13CPA.app"
+unzip -t "release/lich13CPA-0.1.0-mac-arm64.zip"
+file "release/mac-arm64/lich13CPA.app/Contents/MacOS/lich13CPA"
+file "release/mac-arm64/lich13CPA.app/Contents/Resources/embedded-binaries/mac-arm64/cli-proxy-api"
+```
+
+主程序和内嵌 `cli-proxy-api` 都应该显示 `arm64`。
+
+9. 说明
+- `npm run dist:mac` 现在默认只打 zip，避免 DMG 下载工具导致的卡死。
+- 打包前会自动执行 `scripts/prepare-mac-build.mjs`，检查 Node 版本、CPU 架构、Xcode CLT、图标尺寸和 mac 二进制权限。
+- 默认是 ad-hoc 签名，适合自测。如果要对外分发，仍需你自己的 Apple Developer 证书与 notarization。
+
