@@ -1,0 +1,126 @@
+{
+  "name": "lich13cpa",
+  "productName": "lich13CPA",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Minimal single-exe desktop shell for CLIProxyAPI with same-folder config, auth, and binary flow.",
+  "main": "dist-electron/main.cjs",
+  "type": "module",
+  "scripts": {
+    "dev": "npm run build && electron .",
+    "dev:live": "concurrently -k -n renderer,electron,app -c cyan,magenta,green \"npm:dev:renderer\" \"npm:dev:electron\" \"npm:dev:app\"",
+    "dev:app": "node scripts/dev-app.mjs",
+    "dev:electron": "tsup --config tsup.config.ts --watch",
+    "dev:renderer": "vite",
+    "build:icon": "powershell -ExecutionPolicy Bypass -File scripts/generate-icon.ps1",
+    "build": "tsc -b && npm run build:renderer && npm run build:electron",
+    "build:electron": "tsup --config tsup.config.ts",
+    "build:renderer": "vite build",
+    "prepare:win-binaries": "node scripts/prepare-win-binaries.mjs",
+    "dist": "npm run dist:win",
+    "dist:mac": "npm run build && electron-builder --mac",
+    "dist:win": "npm run dist:win:prepare && npm run dist:win:pack:x64 && npm run dist:win:pack:arm64",
+    "dist:win:prepare": "npm run prepare:win-binaries && npm run build:icon && npm run build",
+    "dist:win:pack:x64": "electron-builder --win nsis --x64",
+    "dist:win:pack:arm64": "electron-builder --win nsis --arm64",
+    "dist:win:x64": "npm run dist:win:prepare && npm run dist:win:pack:x64",
+    "dist:win:arm64": "npm run dist:win:prepare && npm run dist:win:pack:arm64",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "start": "electron ."
+  },
+  "dependencies": {
+    "chokidar": "^5.0.0",
+    "lucide-react": "^1.7.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "yaml": "^2.8.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "@types/node": "^24.12.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "concurrently": "^9.2.1",
+    "electron": "^41.1.1",
+    "electron-builder": "^26.8.1",
+    "electronmon": "^2.0.4",
+    "eslint": "^9.39.4",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "globals": "^17.4.0",
+    "rimraf": "^6.1.3",
+    "tsup": "^8.5.1",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.57.0",
+    "vite": "^8.0.1",
+    "wait-on": "^9.0.4"
+  },
+  "build": {
+    "appId": "com.lich13.cpa",
+    "productName": "lich13CPA",
+    "artifactName": "lich13CPA-${version}-${os}-${arch}.${ext}",
+    "compression": "maximum",
+    "icon": "build/icon.png",
+    "afterPack": "scripts/after-pack.cjs",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "embedded-binaries",
+        "to": "embedded-binaries"
+      },
+      {
+        "from": "build/icon.ico",
+        "to": "tray-assets/icon.ico"
+      },
+      {
+        "from": "build/icon.png",
+        "to": "tray-assets/icon.png"
+      }
+    ],
+    "extraMetadata": {
+      "main": "dist-electron/main.cjs"
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "artifactName": "lich13CPA-${version}-win-${arch}-setup.${ext}",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ]
+    },
+    "mac": {
+      "icon": "build/icon.png",
+      "extendInfo": {
+        "LSUIElement": true
+      },
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ]
+    }
+  }
+}
