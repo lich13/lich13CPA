@@ -87,6 +87,7 @@ const MAX_USAGE_PROCESSED_FILE_IDS = 6000
 const MAX_LOG_ENTRIES = 600
 const CLIPROXY_REPOSITORY = 'router-for-me/CLIProxyAPI'
 const CLIPROXY_RELEASES_LATEST_URL = `https://github.com/${CLIPROXY_REPOSITORY}/releases/latest`
+const CLIPROXY_RELEASES_LATEST_API_URL = `https://api.github.com/repos/${CLIPROXY_REPOSITORY}/releases/latest`
 const DEFAULT_ANTIGRAVITY_PROJECT_ID = 'bamboo-precept-lgxtn'
 const ANTIGRAVITY_QUOTA_URLS = [
   'https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
@@ -250,6 +251,7 @@ const OPUS_THINKING_MODELS = [
 const MANAGED_THINKING_MODEL_NAMES = new Set(
   [...SONNET_THINKING_MODELS, ...OPUS_THINKING_MODELS].map((model) => model.name),
 )
+const MANAGED_REASONING_EFFORT_MARKER = 'x-cliproxy-desktop-reasoning-effort'
 
 type PlainObject = Record<string, unknown>
 type ArchiveKind = 'tar.gz' | 'zip'
@@ -986,11 +988,6 @@ function compareVersions(
   return 0
 }
 
-function extractReleaseTagFromUrl(input: string): string | null {
-  const match = input.match(/\/releases\/tag\/([^/?#]+)/i)
-  return match?.[1] ?? null
-}
-
 function getWindowsReleaseArchSuffix(): 'amd64' | 'arm64' {
   if (process.arch === 'x64') {
     return 'amd64'
@@ -1164,6 +1161,15 @@ function buildManagedThinkingEntries(tokenBudget: number): PlainObject[] {
   ]
 }
 
+function buildManagedReasoningEffortEntry(reasoningEffort: ReasoningEffort): PlainObject {
+  return {
+    params: {
+      'reasoning.effort': reasoningEffort,
+      _managedBy: MANAGED_REASONING_EFFORT_MARKER,
+    },
+  }
+}
+
 function isManagedThinkingEntry(entry: unknown): boolean {
   const entryObject = asObject(entry)
   const params = asObject(entryObject.params)
@@ -1176,6 +1182,13 @@ function isManagedThinkingEntry(entry: unknown): boolean {
   const names = models.map((model) => readString(asObject(model).name)).filter(Boolean)
 
   return names.length > 0 && names.every((name) => MANAGED_THINKING_MODEL_NAMES.has(name))
+}
+
+function isManagedReasoningEffortEntry(entry: unknown): boolean {
+  const entryObject = asObject(entry)
+  const params = asObject(entryObject.params)
+
+  return readString(params._managedBy) === MANAGED_REASONING_EFFORT_MARKER
 }
 
 function createDefaultConfig(): PlainObject {
@@ -1206,7 +1219,10 @@ function createDefaultConfig(): PlainObject {
       'disable-control-panel': false,
     },
     payload: {
-      default: buildManagedThinkingEntries(8192),
+      default: [
+        ...buildManagedThinkingEntries(8192),
+        buildManagedReasoningEffortEntry(defaultGuiState.reasoningEffort),
+      ],
     },
     [DESKTOP_METADATA_KEY]: {
       'use-system-proxy': false,
@@ -1250,6 +1266,10 @@ function computeProxyBinaryUpdateAvailable(
   }
 
   if (!hasBinary) {
+    return true
+  }
+
+  if (!currentVersion) {
     return true
   }
 
@@ -1359,7 +1379,34 @@ async function syncProxyBinaryLocalState(binaryPath: string): Promise<void> {
   }
 }
 
-async function fetchLatestReleaseTag(): Promise<string> {
+function findReleaseAssetFromApi(
+  assets: Array<{ name: string; downloadUrl: string }>,
+): { downloadUrl: string; name: string } | null {
+  if (process.platform === 'win32') {
+    const suffix = getWindowsReleaseArchSuffix()
+    const matched = assets.find((asset) =>
+      new RegExp(`^CLIProxyAPI_.*_windows_${suffix}\\.zip$`, 'i').test(asset.name),
+    )
+    return matched ?? null
+  }
+
+  if (process.platform === 'darwin') {
+    const archSuffix = process.arch === 'x64' ? 'amd64' : 'arm64'
+    const matched = assets.find((asset) =>
+      new RegExp(`^CLIProxyAPI_.*_darwin_${archSuffix}\\.tar\\.gz$`, 'i').test(asset.name),
+    )
+    return matched ?? null
+  }
+
+  return null
+}
+
+function extractReleaseTagFromUrl(input: string): string | null {
+  const match = input.match(/\/releases\/tag\/([^/?#]+)/i)
+  return match?.[1] ?? null
+}
+
+async function fetchLatestReleaseTagFromRedirect(): Promise<string> {
   const requestInit = {
     headers: {
       Accept: 'text/html,application/xhtml+xml',
@@ -1381,7 +1428,7 @@ async function fetchLatestReleaseTag(): Promise<string> {
       return resolvedTag
     }
   } catch {
-    // Fall through to the GET request.
+    // Fall through to GET fallback.
   }
 
   const response = await fetch(CLIPROXY_RELEASES_LATEST_URL, {
@@ -1389,16 +1436,84 @@ async function fetchLatestReleaseTag(): Promise<string> {
     method: 'GET',
     redirect: 'follow',
   })
-
   const resolvedTag =
     extractReleaseTagFromUrl(response.url) ??
     extractReleaseTagFromUrl(response.headers.get('location') ?? '')
 
-  if (resolvedTag) {
-    return resolvedTag
+  if (!resolvedTag) {
+    throw new Error('无法解析 CLIProxyAPI 最新发布版本。')
   }
 
-  throw new Error('无法解析 CLIProxyAPI 最新发布版本。')
+  return resolvedTag
+}
+
+async function fetchLatestReleaseDescriptor(): Promise<ReleaseAssetDescriptor> {
+  let apiError: string | null = null
+
+  try {
+    const response = await fetch(CLIPROXY_RELEASES_LATEST_API_URL, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'CLIProxy Desktop',
+      },
+      redirect: 'follow',
+    })
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`)
+    }
+
+    const payload = asObject(await response.json())
+    const tag =
+      normalizeStringValue(payload.tag_name) ??
+      normalizeStringValue(payload.name) ??
+      normalizeStringValue(payload.tag) ??
+      null
+
+    if (!tag) {
+      throw new Error('缺少 tag_name')
+    }
+
+    const descriptor = getReleaseAssetDescriptor(tag)
+    const assets = asArray<PlainObject>(payload.assets)
+      .map((entry) => {
+        const name = normalizeStringValue(entry.name)
+        const downloadUrl = normalizeStringValue(
+          entry.browser_download_url ?? entry.browserDownloadUrl,
+        )
+
+        if (!name || !downloadUrl) {
+          return null
+        }
+
+        return { name, downloadUrl }
+      })
+      .filter((value): value is { name: string; downloadUrl: string } => value !== null)
+    const matchedAsset = findReleaseAssetFromApi(assets)
+
+    if (!matchedAsset) {
+      return descriptor
+    }
+
+    return {
+      ...descriptor,
+      assetName: matchedAsset.name,
+      downloadUrl: matchedAsset.downloadUrl,
+    }
+  } catch (error) {
+    apiError = toErrorMessage(error)
+  }
+
+  try {
+    const tag = await fetchLatestReleaseTagFromRedirect()
+    return getReleaseAssetDescriptor(tag)
+  } catch (error) {
+    throw new Error(
+      `无法获取 CLIProxyAPI 最新版本（API: ${apiError ?? '未知错误'}；Redirect: ${toErrorMessage(
+        error,
+      )}）`,
+    )
+  }
 }
 
 function resolveBinaryInstallTargetPath(
@@ -1518,8 +1633,7 @@ async function refreshProxyBinaryState(): Promise<void> {
     await syncProxyBinaryLocalState(effectiveBinaryPath)
 
     try {
-      const latestTag = await fetchLatestReleaseTag()
-      const descriptor = getReleaseAssetDescriptor(latestTag)
+      const descriptor = await fetchLatestReleaseDescriptor()
 
       proxyBinaryState.latestTag = descriptor.tag
       proxyBinaryState.latestVersion = descriptor.version
@@ -1561,8 +1675,7 @@ async function updateProxyBinaryInternal(): Promise<string> {
       proxyBinaryState.lastCheckedAt = new Date().toISOString()
       proxyBinaryState.lastError = null
 
-      const latestTag = await fetchLatestReleaseTag()
-      const descriptor = getReleaseAssetDescriptor(latestTag)
+      const descriptor = await fetchLatestReleaseDescriptor()
       const targetPath = resolveBinaryInstallTargetPath(
         guiState,
         effectiveBinaryPath,
@@ -1885,6 +1998,26 @@ function applyThinkingBudget(
   config[DESKTOP_METADATA_KEY] = desktop
 }
 
+function extractReasoningEffort(config: PlainObject, guiState: GuiState): ReasoningEffort {
+  const payload = asObject(config.payload)
+  const payloadDefaults = asArray<PlainObject>(payload.default)
+  const managedEntry = payloadDefaults.find(isManagedReasoningEffortEntry)
+  const managedParams = asObject(managedEntry?.params)
+  const reasoningEffort = readString(managedParams['reasoning.effort']) as ReasoningEffort
+
+  if (
+    reasoningEffort === 'minimal' ||
+    reasoningEffort === 'low' ||
+    reasoningEffort === 'medium' ||
+    reasoningEffort === 'high' ||
+    reasoningEffort === 'xhigh'
+  ) {
+    return reasoningEffort
+  }
+
+  return guiState.reasoningEffort
+}
+
 function extractKnownSettings(config: PlainObject, guiState: GuiState): KnownSettings {
   const thinkingBudget = extractThinkingBudget(config)
   const desktop = getDesktopMetadata(config)
@@ -1920,7 +2053,7 @@ function extractKnownSettings(config: PlainObject, guiState: GuiState): KnownSet
     ),
     thinkingBudgetMode: thinkingBudget.mode,
     thinkingBudgetCustom: thinkingBudget.customBudget,
-    reasoningEffort: guiState.reasoningEffort,
+    reasoningEffort: extractReasoningEffort(config, guiState),
     autoSyncOnStop: guiState.autoSyncOnStop,
     launchAtLogin: guiState.launchAtLogin,
     autoStartProxyOnLaunch: guiState.autoStartProxyOnLaunch,
@@ -1993,10 +2126,10 @@ function ensureRequiredConfigFields(config: PlainObject): void {
   )
 }
 
-function applyKnownSettings(
+async function applyKnownSettings(
   config: PlainObject,
   input: SaveKnownSettingsInput,
-): void {
+): Promise<void> {
   ensureRequiredConfigFields(config)
 
   config.port = clampPort(input.port)
@@ -2017,7 +2150,16 @@ function applyKnownSettings(
   config[DESKTOP_METADATA_KEY] = desktop
 
   if (input.useSystemProxy) {
-    config['proxy-url'] = readString(config['proxy-url'])
+    const systemProxyUrl = await detectSystemProxyUrl()
+    const existingProxyUrl = readString(config['proxy-url']).trim()
+
+    if (systemProxyUrl) {
+      config['proxy-url'] = systemProxyUrl
+    } else if (existingProxyUrl) {
+      config['proxy-url'] = existingProxyUrl
+    } else {
+      delete config['proxy-url']
+    }
   } else {
     const nextProxyUrl = input.proxyUrl.trim()
 
@@ -2040,6 +2182,17 @@ function applyKnownSettings(
   config.streaming = streaming
 
   applyThinkingBudget(config, input.thinkingBudgetMode, input.thinkingBudgetCustom)
+  applyReasoningEffort(config, input.reasoningEffort)
+}
+
+function applyReasoningEffort(config: PlainObject, reasoningEffort: ReasoningEffort): void {
+  const payload = asObject(config.payload)
+  const payloadDefaults = asArray<PlainObject>(payload.default).filter(
+    (entry) => !isManagedReasoningEffortEntry(entry),
+  )
+
+  payload.default = [buildManagedReasoningEffortEntry(reasoningEffort), ...payloadDefaults]
+  config.payload = payload
 }
 
 function normalizeProviderModels(models: ProviderModelMapping[]): ProviderModelMapping[] {
@@ -3898,6 +4051,67 @@ async function detectSystemProxyUrl(): Promise<string> {
     return envProxy.trim()
   }
 
+  if (process.platform === 'darwin') {
+    try {
+      const { stdout } = await execFileAsync('scutil', ['--proxy'])
+      const pairs = new Map<string, string>()
+
+      for (const line of stdout.split(/\r?\n/)) {
+        const match = line.match(/^\s*([A-Za-z0-9_]+)\s*:\s*(.+)\s*$/)
+
+        if (!match) {
+          continue
+        }
+
+        pairs.set(match[1], match[2].trim())
+      }
+
+      const readEnabled = (key: string): boolean => {
+        const value = pairs.get(key)
+        return value === '1' || value?.toLowerCase() === 'true'
+      }
+      const readEndpoint = (hostKey: string, portKey: string): string | null => {
+        const host = pairs.get(hostKey)?.trim()
+        const port = pairs.get(portKey)?.trim()
+
+        if (!host) {
+          return null
+        }
+
+        const normalizedPort = port && /^\d+$/.test(port) ? `:${port}` : ''
+        return `${host}${normalizedPort}`
+      }
+
+      if (readEnabled('HTTPEnable')) {
+        const endpoint = readEndpoint('HTTPProxy', 'HTTPPort')
+
+        if (endpoint) {
+          return `http://${endpoint}`
+        }
+      }
+
+      if (readEnabled('HTTPSEnable')) {
+        const endpoint = readEndpoint('HTTPSProxy', 'HTTPSPort')
+
+        if (endpoint) {
+          return `http://${endpoint}`
+        }
+      }
+
+      if (readEnabled('SOCKSEnable')) {
+        const endpoint = readEndpoint('SOCKSProxy', 'SOCKSPort')
+
+        if (endpoint) {
+          return `socks5://${endpoint}`
+        }
+      }
+    } catch {
+      return ''
+    }
+
+    return ''
+  }
+
   if (process.platform !== 'win32') {
     return ''
   }
@@ -3954,6 +4168,34 @@ async function detectSystemProxyUrl(): Promise<string> {
 
         return `http://${candidate}`
       }
+    }
+
+    if (/^[a-z]+:\/\//i.test(rawProxy)) {
+      return rawProxy
+    }
+
+    return `http://${rawProxy}`
+  } catch {
+    // Fall through to winhttp fallback.
+  }
+
+  try {
+    const { stdout } = await execFileAsync('netsh', ['winhttp', 'show', 'proxy'], {
+      windowsHide: true,
+    })
+    const lines = stdout.split(/\r?\n/).map((line) => line.trim())
+    const proxyLine =
+      lines.find((line) => /^Proxy Server\(s\)\s*:/i.test(line)) ??
+      lines.find((line) => /^代理服务器\s*:/i.test(line))
+
+    if (!proxyLine) {
+      return ''
+    }
+
+    const rawProxy = proxyLine.replace(/^.*?:\s*/, '').trim()
+
+    if (!rawProxy || /direct access/i.test(rawProxy) || /直接访问/i.test(rawProxy)) {
+      return ''
     }
 
     if (/^[a-z]+:\/\//i.test(rawProxy)) {
@@ -6046,7 +6288,6 @@ function classifyCodexWindows(limitInfo: PlainObject): {
 
   if (
     !weeklyWindow &&
-    !fiveHourWindow &&
     Object.keys(secondaryWindow).length > 0 &&
     secondaryWindow !== fiveHourWindow
   ) {
@@ -6057,6 +6298,46 @@ function classifyCodexWindows(limitInfo: PlainObject): {
     fiveHourWindow,
     weeklyWindow,
   }
+}
+
+function parseManagementApiBodyObject(result: ManagementApiCallResponse): PlainObject {
+  const parseAsObject = (value: unknown): PlainObject | null => {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return asObject(value)
+    }
+
+    if (typeof value === 'string') {
+      const trimmed = value.trim()
+
+      if (!trimmed) {
+        return null
+      }
+
+      try {
+        const parsed = JSON.parse(trimmed)
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? asObject(parsed)
+          : null
+      } catch {
+        return null
+      }
+    }
+
+    return null
+  }
+
+  const topLevel =
+    parseAsObject(result.body) ??
+    parseAsObject(result.bodyText) ??
+    parseAsObject((asObject(result.body).body)) ??
+    {}
+  const nestedBody = parseAsObject(topLevel.body)
+
+  if (nestedBody && Object.keys(nestedBody).length > 0) {
+    return nestedBody
+  }
+
+  return topLevel
 }
 
 function addCodexQuotaItem(
@@ -6759,7 +7040,7 @@ async function getAuthFileQuotaV2(fileName: string): Promise<AuthFileQuotaSummar
       throw new Error(getApiCallErrorMessageV2(result))
     }
 
-    return buildCodexQuotaSummary(record, asObject(result.body))
+    return buildCodexQuotaSummary(record, parseManagementApiBodyObject(result))
     /*
 
     if (!localChatgptAccountId) {
@@ -6812,9 +7093,9 @@ async function getAuthFileQuotaV2(fileName: string): Promise<AuthFileQuotaSummar
 
     return buildClaudeQuotaSummary(
       record,
-      asObject(usageResult.body),
+      parseManagementApiBodyObject(usageResult),
       profileResult.statusCode >= 200 && profileResult.statusCode < 300
-        ? asObject(profileResult.body)
+        ? parseManagementApiBodyObject(profileResult)
         : null,
     )
   }
@@ -6863,9 +7144,9 @@ async function getAuthFileQuotaV2(fileName: string): Promise<AuthFileQuotaSummar
 
     return buildGeminiCliQuotaSummary(
       record,
-      asObject(quotaResult.body),
+      parseManagementApiBodyObject(quotaResult),
       codeAssistResult.statusCode >= 200 && codeAssistResult.statusCode < 300
-        ? asObject(codeAssistResult.body)
+        ? parseManagementApiBodyObject(codeAssistResult)
         : null,
     )
   }
@@ -6891,7 +7172,11 @@ async function getAuthFileQuotaV2(fileName: string): Promise<AuthFileQuotaSummar
       }))
 
       if (result.statusCode >= 200 && result.statusCode < 300) {
-        return buildAntigravityQuotaSummary(record, asObject(result.body), projectId)
+        return buildAntigravityQuotaSummary(
+          record,
+          parseManagementApiBodyObject(result),
+          projectId,
+        )
       }
 
       lastError = getApiCallErrorMessageV2(result)
@@ -6911,7 +7196,7 @@ async function getAuthFileQuotaV2(fileName: string): Promise<AuthFileQuotaSummar
     throw new Error(getApiCallErrorMessageV2(result))
   }
 
-  return buildKimiQuotaSummary(record, asObject(result.body))
+  return buildKimiQuotaSummary(record, parseManagementApiBodyObject(result))
 }
 
 async function buildAppStateV2(): Promise<DesktopAppState> {
@@ -7415,7 +7700,7 @@ function registerIpcHandlersV2(): void {
     'cliproxy:saveKnownSettings',
     async (_event, input: SaveKnownSettingsInput) => {
       const config = parseConfigObjectV2(await readConfigText())
-      applyKnownSettings(config, input)
+      await applyKnownSettings(config, input)
       await writeConfigObjectV2(config)
       const nextGuiState = await writeGuiState({
         reasoningEffort: input.reasoningEffort,
@@ -8100,7 +8385,7 @@ function registerIpcHandlers(): void {
     'cliproxy:saveKnownSettings',
     async (_event, input: SaveKnownSettingsInput) => {
       const config = parseConfigObject(await readConfigText())
-      applyKnownSettings(config, input)
+      await applyKnownSettings(config, input)
       await writeConfigObject(config)
       await writeGuiState({
         reasoningEffort: input.reasoningEffort,
