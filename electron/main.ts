@@ -6101,7 +6101,6 @@ function classifyCodexWindows(limitInfo: PlainObject): {
 
   if (
     !weeklyWindow &&
-    !fiveHourWindow &&
     Object.keys(secondaryWindow).length > 0 &&
     secondaryWindow !== fiveHourWindow
   ) {
@@ -6112,6 +6111,46 @@ function classifyCodexWindows(limitInfo: PlainObject): {
     fiveHourWindow,
     weeklyWindow,
   }
+}
+
+function parseManagementApiBodyObject(result: ManagementApiCallResponse): PlainObject {
+  const parseAsObject = (value: unknown): PlainObject | null => {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return asObject(value)
+    }
+
+    if (typeof value === 'string') {
+      const trimmed = value.trim()
+
+      if (!trimmed) {
+        return null
+      }
+
+      try {
+        const parsed = JSON.parse(trimmed)
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? asObject(parsed)
+          : null
+      } catch {
+        return null
+      }
+    }
+
+    return null
+  }
+
+  const topLevel =
+    parseAsObject(result.body) ??
+    parseAsObject(result.bodyText) ??
+    parseAsObject((asObject(result.body).body)) ??
+    {}
+  const nestedBody = parseAsObject(topLevel.body)
+
+  if (nestedBody && Object.keys(nestedBody).length > 0) {
+    return nestedBody
+  }
+
+  return topLevel
 }
 
 function addCodexQuotaItem(
@@ -6814,7 +6853,7 @@ async function getAuthFileQuotaV2(fileName: string): Promise<AuthFileQuotaSummar
       throw new Error(getApiCallErrorMessageV2(result))
     }
 
-    return buildCodexQuotaSummary(record, asObject(result.body))
+    return buildCodexQuotaSummary(record, parseManagementApiBodyObject(result))
     /*
 
     if (!localChatgptAccountId) {
@@ -6867,9 +6906,9 @@ async function getAuthFileQuotaV2(fileName: string): Promise<AuthFileQuotaSummar
 
     return buildClaudeQuotaSummary(
       record,
-      asObject(usageResult.body),
+      parseManagementApiBodyObject(usageResult),
       profileResult.statusCode >= 200 && profileResult.statusCode < 300
-        ? asObject(profileResult.body)
+        ? parseManagementApiBodyObject(profileResult)
         : null,
     )
   }
@@ -6918,9 +6957,9 @@ async function getAuthFileQuotaV2(fileName: string): Promise<AuthFileQuotaSummar
 
     return buildGeminiCliQuotaSummary(
       record,
-      asObject(quotaResult.body),
+      parseManagementApiBodyObject(quotaResult),
       codeAssistResult.statusCode >= 200 && codeAssistResult.statusCode < 300
-        ? asObject(codeAssistResult.body)
+        ? parseManagementApiBodyObject(codeAssistResult)
         : null,
     )
   }
@@ -6946,7 +6985,11 @@ async function getAuthFileQuotaV2(fileName: string): Promise<AuthFileQuotaSummar
       }))
 
       if (result.statusCode >= 200 && result.statusCode < 300) {
-        return buildAntigravityQuotaSummary(record, asObject(result.body), projectId)
+        return buildAntigravityQuotaSummary(
+          record,
+          parseManagementApiBodyObject(result),
+          projectId,
+        )
       }
 
       lastError = getApiCallErrorMessageV2(result)
@@ -6966,7 +7009,7 @@ async function getAuthFileQuotaV2(fileName: string): Promise<AuthFileQuotaSummar
     throw new Error(getApiCallErrorMessageV2(result))
   }
 
-  return buildKimiQuotaSummary(record, asObject(result.body))
+  return buildKimiQuotaSummary(record, parseManagementApiBodyObject(result))
 }
 
 async function buildAppStateV2(): Promise<DesktopAppState> {
