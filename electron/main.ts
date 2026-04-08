@@ -34,6 +34,7 @@ import type {
   AuthFileQuotaSummary,
   DeleteAiProviderInput,
   DesktopAppState,
+  FetchProviderModelsInput,
   OpenAICompatibleProviderRecord,
   ProviderApiKeyEntry,
   KnownSettings,
@@ -5816,6 +5817,48 @@ async function fetchManagementTextV2(
   throw lastError ?? new Error('管理接口请求失败。')
 }
 
+async function requestManagementJsonV2<T>(
+  port: number,
+  managementApiKey: string,
+  endpointPath: string,
+  method: 'PATCH' | 'POST' | 'PUT',
+  payload: unknown,
+): Promise<T> {
+  const requestUrl = `${buildManagementApiBaseUrl(port)}${endpointPath}`
+  let lastError: Error | null = null
+  const body = JSON.stringify(payload)
+
+  for (const candidateKey of dedupeStrings([managementApiKey, DEFAULT_MANAGEMENT_API_KEY])) {
+    try {
+      const response = await fetch(requestUrl, {
+        method,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Management-Key': candidateKey,
+        },
+        body,
+        signal: AbortSignal.timeout(5000),
+      })
+
+      if (response.status === 401) {
+        lastError = new Error('管理密钥无效。')
+        continue
+      }
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`)
+      }
+
+      return (await response.json()) as T
+    } catch (error) {
+      lastError =
+        error instanceof Error ? error : new Error(typeof error === 'string' ? error : '请求失败。')
+    }
+  }
+
+  throw lastError ?? new Error('管理接口请求失败。')
+}
+
 async function fetchManagementJsonV2<T>(
   port: number,
   managementApiKey: string,
@@ -5823,6 +5866,118 @@ async function fetchManagementJsonV2<T>(
 ): Promise<T> {
   const rawText = await fetchManagementTextV2(port, managementApiKey, endpointPath)
   return JSON.parse(rawText) as T
+}
+
+function normalizeProviderModelsUrl(baseUrl: string): string {
+  const normalized = baseUrl.trim().replace(/\/+$/, '')
+  if (!normalized) {
+    throw new Error('请先填写 Base URL。')
+  }
+  return normalized.toLowerCase().endsWith('/models') ? normalized : `${normalized}/models`
+}
+
+function parseProviderModelsPayload(payload: unknown): string[] {
+  const pushModel = (bucket: Set<string>, candidate: unknown) => {
+    const modelId = normalizeStringValue(candidate)
+    if (modelId) {
+      bucket.add(modelId)
+    }
+  }
+  const root = asObject(payload)
+  const modelSet = new Set<string>()
+  const data = Array.isArray(root.data) ? root.data : Array.isArray(payload) ? payload : []
+
+  for (const entry of data) {
+    if (typeof entry === 'string') {
+      pushModel(modelSet, entry)
+      continue
+    }
+
+    const record = asObject(entry)
+    pushModel(modelSet, record.id)
+    pushModel(modelSet, record.model)
+    pushModel(modelSet, record.name)
+  }
+
+  return [...modelSet].sort((left, right) => left.localeCompare(right, 'en'))
+}
+
+async function fetchProviderModelsV2(input: FetchProviderModelsInput): Promise<string[]> {
+  const requestUrl = normalizeProviderModelsUrl(input.baseUrl)
+  const headers = new Headers()
+  headers.set('Accept', 'application/json')
+
+  for (const entry of input.headers ?? []) {
+    const key = normalizeStringValue(entry.key)
+    const value = normalizeStringValue(entry.value)
+
+    if (key && value) {
+      headers.set(key, value)
+    }
+  }
+
+  if (input.apiKey?.trim() && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${input.apiKey.trim()}`)
+  }
+
+  const response = await fetch(requestUrl, {
+    headers,
+    signal: AbortSignal.timeout(10000),
+  })
+
+  if (!response.ok) {
+    throw new Error(`拉取模型失败：HTTP ${response.status}`)
+  }
+
+  const payload = (await response.json()) as unknown
+  const models = parseProviderModelsPayload(payload)
+
+  if (models.length === 0) {
+    throw new Error('拉取成功，但未解析到模型列表。')
+  }
+
+  return models
+}
+
+async function notifyProxyAuthFilesChangedV2(): Promise<void> {
+  if (!proxyStatus.running) {
+    return
+  }
+
+  try {
+    const runtime = await resolveManagementRuntimeV2()
+    await fetchManagementTextV2(runtime.port, runtime.managementApiKey, '/v0/management/auth-files')
+  } catch (error) {
+    await appendLog('warn', 'app', `认证文件切换后刷新管理端状态失败：${toErrorMessage(error)}`)
+  }
+}
+
+async function trySyncRuntimeAuthFileStatusV2(fileName: string, disabled: boolean): Promise<boolean> {
+  if (!proxyStatus.running) {
+    return false
+  }
+
+  try {
+    const runtime = await resolveManagementRuntimeV2()
+    await requestManagementJsonV2(
+      runtime.port,
+      runtime.managementApiKey,
+      '/v0/management/auth-files/status',
+      'PATCH',
+      {
+        name: stripDisabledMarker(fileName),
+        disabled,
+      },
+    )
+    return true
+  } catch (error) {
+    await appendLog(
+      'warn',
+      'app',
+      `调用管理端 auth-files/status 失败，已回退为本地刷新模式：${toErrorMessage(error)}`,
+    )
+    return false
+  }
 }
 
 async function ensureProxyReadyForProviderAuthV2(): Promise<void> {
@@ -7855,6 +8010,7 @@ function registerIpcHandlersV2(): void {
   ipcMain.handle('cliproxy:toggleAuthFile', async (_event, fileName: string) => {
     const sourcePath = resolveInsideDirectory(resolvePaths().authDir, fileName)
     const willEnable = isDisabledAuthFile(fileName)
+    const willDisable = !willEnable
     const nextName = willEnable ? toEnabledAuthName(fileName) : toDisabledAuthName(fileName)
     const targetPath = resolveInsideDirectory(resolvePaths().authDir, nextName)
 
@@ -7864,8 +8020,15 @@ function registerIpcHandlersV2(): void {
 
     await fs.rename(sourcePath, targetPath)
     await appendLog('info', 'app', `认证文件已${willEnable ? '启用' : '禁用'}：${fileName}`)
+    const runtimeStatusSynced = await trySyncRuntimeAuthFileStatusV2(nextName, willDisable)
+    if (!runtimeStatusSynced) {
+      await notifyProxyAuthFilesChangedV2()
+    }
     return buildAppStateV2()
   })
+  ipcMain.handle('cliproxy:fetchProviderModels', async (_event, input: FetchProviderModelsInput) =>
+    fetchProviderModelsV2(input),
+  )
 
   ipcMain.handle('cliproxy:getAuthFileQuota', async (_event, fileName: string) =>
     getAuthFileQuotaV2(fileName),

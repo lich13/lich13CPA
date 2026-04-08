@@ -2,6 +2,7 @@ import {
   BarChart3,
   Bot,
   CircleAlert,
+  Download,
   ExternalLink,
   FolderOpen,
   HardDriveUpload,
@@ -29,6 +30,7 @@ import type {
   AuthFileQuotaSummary,
   AuthFileRecord,
   DesktopAppState,
+  FetchProviderModelsInput,
   GeminiProviderRecord,
   OpenAICompatibleProviderRecord,
   ProviderApiKeyEntry,
@@ -52,6 +54,7 @@ type QuotaState = { error: string | null; loading: boolean; summary: AuthFileQuo
 type KeyProviderKind = 'gemini' | 'codex' | 'claude' | 'vertex'
 type ProviderEditorKind = KeyProviderKind | 'openai-compatibility' | 'ampcode'
 type UsageCustomRangeDraft = { endAt: string; startAt: string }
+type EditableModelEntry = { alias: string; id: string; name: string }
 
 type KeyProviderEditorState = {
   apiKey: string
@@ -720,6 +723,39 @@ function stringifyModels(models: ProviderModelMapping[]): string {
     .join('\n')
 }
 
+function createModelEntryId(): string {
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+function toEditableModelEntries(value: string): EditableModelEntry[] {
+  const parsed = parseModelsText(value)
+
+  if (parsed.length === 0) {
+    return [{ id: createModelEntryId(), name: '', alias: '' }]
+  }
+
+  return parsed.map((entry) => ({
+    id: createModelEntryId(),
+    name: entry.name,
+    alias: entry.alias === entry.name ? '' : entry.alias,
+  }))
+}
+
+function editableEntriesToModelsText(entries: EditableModelEntry[]): string {
+  const models = entries
+    .map((entry) => ({
+      name: entry.name.trim(),
+      alias: entry.alias.trim(),
+    }))
+    .filter((entry) => entry.name)
+    .map((entry) => ({
+      name: entry.name,
+      alias: entry.alias || entry.name,
+    }))
+
+  return stringifyModels(models)
+}
+
 function parseHeadersText(value: string): ProviderHeaderEntry[] {
   return parseLines(value)
     .map((line) => {
@@ -997,6 +1033,8 @@ function App() {
   const [usageLoading, setUsageLoading] = useState(false)
   const [settingsDirty, setSettingsDirty] = useState(false)
   const [settingsDraft, setSettingsDraft] = useState<SaveKnownSettingsInput>(EMPTY_SETTINGS)
+  const [discoveredModels, setDiscoveredModels] = useState<string[]>([])
+  const [selectedDiscoveredModels, setSelectedDiscoveredModels] = useState<Record<string, boolean>>({})
   const mountedRef = useRef(true)
   const quotaRequestedRef = useRef(new Set<string>())
   const authPollTimerRef = useRef<Record<string, number>>({})
@@ -1515,6 +1553,76 @@ function App() {
     setProviderEditor(null)
   }
 
+  async function fetchModelsForProviderEditor() {
+    if (!providerEditor || providerEditor.kind === 'ampcode') {
+      return
+    }
+
+    const input: FetchProviderModelsInput =
+      providerEditor.kind === 'openai-compatibility'
+        ? {
+            baseUrl: providerEditor.baseUrl,
+            headers: parseHeadersText(providerEditor.headersText),
+            apiKey:
+              parseApiKeyEntriesText(providerEditor.apiKeyEntriesText).find((entry) => entry.apiKey.trim())?.apiKey ??
+              '',
+          }
+        : {
+            baseUrl: providerEditor.baseUrl,
+            apiKey: providerEditor.apiKey,
+            headers: parseHeadersText(providerEditor.headersText),
+          }
+
+    const models = await runAction(
+      `fetch-provider-models-${providerEditor.kind}`,
+      () => window.cliproxy.fetchProviderModels(input),
+      '已拉取模型列表，请勾选后添加',
+    )
+    setDiscoveredModels(models)
+    setSelectedDiscoveredModels(
+      Object.fromEntries(models.map((modelName) => [modelName, true])),
+    )
+  }
+
+  function toggleDiscoveredModel(modelName: string, checked: boolean) {
+    setSelectedDiscoveredModels((current) => ({
+      ...current,
+      [modelName]: checked,
+    }))
+  }
+
+  function applySelectedDiscoveredModels() {
+    if (!providerEditor || providerEditor.kind === 'ampcode') {
+      return
+    }
+
+    const selectedNames = discoveredModels.filter((modelName) => selectedDiscoveredModels[modelName])
+
+    if (selectedNames.length === 0) {
+      pushNotice('error', '请先勾选要添加的模型')
+      return
+    }
+
+    const existing = parseModelsText(providerEditor.modelsText)
+    const existingNames = new Set(existing.map((entry) => entry.name))
+    const appended = selectedNames
+      .filter((name) => !existingNames.has(name))
+      .map((name) => ({ name, alias: name }))
+
+    const nextModelsText = stringifyModels([...existing, ...appended])
+
+    setProviderEditor((current) =>
+      current && current.kind !== 'ampcode'
+        ? {
+            ...current,
+            modelsText: nextModelsText,
+          }
+        : current,
+    )
+
+    pushNotice('success', appended.length > 0 ? `已添加 ${appended.length} 个模型` : '所选模型已存在')
+  }
+
   useEffect(() => {
     mountedRef.current = true
     void loadState()
@@ -1551,6 +1659,18 @@ function App() {
       window.clearTimeout(timer)
     }
   }, [notice])
+
+  const providerEditorIdentity =
+    providerEditor
+      ? `${providerEditor.kind}-${
+          'index' in providerEditor ? String(providerEditor.index ?? 'new') : 'single'
+        }`
+      : 'none'
+
+  useEffect(() => {
+    setDiscoveredModels([])
+    setSelectedDiscoveredModels({})
+  }, [providerEditorIdentity])
 
   useEffect(() => {
     if (!appState || settingsDirty) {
@@ -2150,6 +2270,121 @@ function App() {
     ))
   }
 
+  function renderProviderModelEditor(kind: Exclude<ProviderEditorKind, 'ampcode'>, modelsText: string) {
+    const entries = toEditableModelEntries(modelsText)
+    const selectedCount = discoveredModels.filter((modelName) => selectedDiscoveredModels[modelName]).length
+
+    const updateEntries = (updater: (entries: EditableModelEntry[]) => EditableModelEntry[]) => {
+      setProviderEditor((current) => {
+        if (!current || current.kind === 'ampcode' || current.kind !== kind) {
+          return current
+        }
+
+        const nextEntries = updater(toEditableModelEntries(current.modelsText))
+
+        return {
+          ...current,
+          modelsText: editableEntriesToModelsText(nextEntries),
+        }
+      })
+    }
+
+    return (
+      <div className="provider-model-editor">
+        <div className="provider-model-head">
+          <strong>模型列表（name / alias）</strong>
+          <div className="mini-actions">
+            <button
+              className="ghost-button"
+              onClick={() => updateEntries((current) => [...current, { id: createModelEntryId(), name: '', alias: '' }])}
+              type="button"
+            >
+              添加模型
+            </button>
+            <button
+              className="ghost-button"
+              disabled={busyAction === `fetch-provider-models-${kind}`}
+              onClick={() => {
+                void fetchModelsForProviderEditor()
+              }}
+              type="button"
+            >
+              <Download size={16} />
+              从 /models 获取
+            </button>
+          </div>
+        </div>
+        <span className="input-help">示例：gpt-4o-mini 或 moonshotai/kimi-k2:free, kimi-k2</span>
+        <div className="provider-model-list">
+          {entries.map((entry) => (
+            <div className="provider-model-row" key={entry.id}>
+              <input
+                className="field-input"
+                onChange={(event) =>
+                  updateEntries((current) =>
+                    current.map((item) =>
+                      item.id === entry.id ? { ...item, name: event.target.value } : item,
+                    ),
+                  )
+                }
+                placeholder="模型名称，例如 claude-3-5-sonnet-20241022"
+                value={entry.name}
+              />
+              <span>→</span>
+              <input
+                className="field-input"
+                onChange={(event) =>
+                  updateEntries((current) =>
+                    current.map((item) =>
+                      item.id === entry.id ? { ...item, alias: event.target.value } : item,
+                    ),
+                  )
+                }
+                placeholder="模型别名（可选）"
+                value={entry.alias}
+              />
+              <button
+                className="icon-button"
+                onClick={() =>
+                  updateEntries((current) =>
+                    current.length <= 1
+                      ? [{ ...current[0], name: '', alias: '' }]
+                      : current.filter((item) => item.id !== entry.id),
+                  )
+                }
+                type="button"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+        {discoveredModels.length > 0 ? (
+          <div className="provider-model-picker">
+            <div className="provider-model-picker-head">
+              <span>已拉取 {discoveredModels.length} 个模型</span>
+              <button className="ghost-button" onClick={applySelectedDiscoveredModels} type="button">
+                添加勾选模型（{selectedCount}）
+              </button>
+            </div>
+            <div className="provider-model-picker-list">
+              {discoveredModels.map((modelName) => (
+                <label className="provider-model-picker-item" key={modelName}>
+                  <input
+                    checked={Boolean(selectedDiscoveredModels[modelName])}
+                    onChange={(event) => toggleDiscoveredModel(modelName, event.target.checked)}
+                    type="checkbox"
+                  />
+                  <span>{modelName}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </div>
+    )
+  }
+
   function renderProviderEditor() {
     if (!providerEditor) {
       return (
@@ -2237,19 +2472,7 @@ function App() {
             placeholder="Authorization = Bearer xxx"
             value={providerEditor.headersText}
           />
-          <TextAreaField
-            help="每行一个模型，支持 alias = name。"
-            label="模型映射"
-            onChange={(value) =>
-              setProviderEditor((current) =>
-                current && current.kind === 'openai-compatibility'
-                  ? { ...current, modelsText: value }
-                  : current,
-              )
-            }
-            placeholder="gpt-4o = gpt-4o"
-            value={providerEditor.modelsText}
-          />
+          {renderProviderModelEditor('openai-compatibility', providerEditor.modelsText)}
           <TextAreaField
             help="每行一个 Key 条目，格式 apiKey | proxyUrl | HeaderA=1; HeaderB=2。"
             label="API Key 条目"
@@ -2415,19 +2638,7 @@ function App() {
           placeholder="Authorization = Bearer xxx"
           value={providerEditor.headersText}
         />
-        <TextAreaField
-          help="每行一个模型，支持 alias = name。"
-          label="模型映射"
-          onChange={(value) =>
-            setProviderEditor((current) =>
-              current && current.kind === providerEditor.kind
-                ? { ...current, modelsText: value }
-                : current,
-            )
-          }
-          placeholder="claude-sonnet-4-5"
-          value={providerEditor.modelsText}
-        />
+        {renderProviderModelEditor(providerEditor.kind, providerEditor.modelsText)}
         <TextAreaField
           help="每行一个要排除的模型名。"
           label="排除模型"
