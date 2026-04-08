@@ -86,7 +86,7 @@ const MIN_USAGE_LOG_FILE_AGE_MS = 1500
 const MAX_USAGE_PROCESSED_FILE_IDS = 6000
 const MAX_LOG_ENTRIES = 600
 const CLIPROXY_REPOSITORY = 'router-for-me/CLIProxyAPI'
-const CLIPROXY_RELEASES_LATEST_URL = `https://github.com/${CLIPROXY_REPOSITORY}/releases/latest`
+const CLIPROXY_RELEASES_LATEST_API_URL = `https://api.github.com/repos/${CLIPROXY_REPOSITORY}/releases/latest`
 const DEFAULT_ANTIGRAVITY_PROJECT_ID = 'bamboo-precept-lgxtn'
 const ANTIGRAVITY_QUOTA_URLS = [
   'https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
@@ -987,11 +987,6 @@ function compareVersions(
   return 0
 }
 
-function extractReleaseTagFromUrl(input: string): string | null {
-  const match = input.match(/\/releases\/tag\/([^/?#]+)/i)
-  return match?.[1] ?? null
-}
-
 function getWindowsReleaseArchSuffix(): 'amd64' | 'arm64' {
   if (process.arch === 'x64') {
     return 'amd64'
@@ -1383,46 +1378,78 @@ async function syncProxyBinaryLocalState(binaryPath: string): Promise<void> {
   }
 }
 
-async function fetchLatestReleaseTag(): Promise<string> {
-  const requestInit = {
+function findReleaseAssetFromApi(
+  assets: Array<{ name: string; downloadUrl: string }>,
+): { downloadUrl: string; name: string } | null {
+  if (process.platform === 'win32') {
+    const suffix = getWindowsReleaseArchSuffix()
+    const matched = assets.find((asset) =>
+      new RegExp(`^CLIProxyAPI_.*_windows_${suffix}\\.zip$`, 'i').test(asset.name),
+    )
+    return matched ?? null
+  }
+
+  if (process.platform === 'darwin') {
+    const archSuffix = process.arch === 'x64' ? 'amd64' : 'arm64'
+    const matched = assets.find((asset) =>
+      new RegExp(`^CLIProxyAPI_.*_darwin_${archSuffix}\\.tar\\.gz$`, 'i').test(asset.name),
+    )
+    return matched ?? null
+  }
+
+  return null
+}
+
+async function fetchLatestReleaseDescriptor(): Promise<ReleaseAssetDescriptor> {
+  const response = await fetch(CLIPROXY_RELEASES_LATEST_API_URL, {
     headers: {
-      Accept: 'text/html,application/xhtml+xml',
+      Accept: 'application/vnd.github+json',
       'User-Agent': 'CLIProxy Desktop',
     },
-  }
-
-  try {
-    const response = await fetch(CLIPROXY_RELEASES_LATEST_URL, {
-      ...requestInit,
-      method: 'HEAD',
-      redirect: 'manual',
-    })
-    const resolvedTag =
-      extractReleaseTagFromUrl(response.headers.get('location') ?? '') ??
-      extractReleaseTagFromUrl(response.url)
-
-    if (resolvedTag) {
-      return resolvedTag
-    }
-  } catch {
-    // Fall through to the GET request.
-  }
-
-  const response = await fetch(CLIPROXY_RELEASES_LATEST_URL, {
-    ...requestInit,
-    method: 'GET',
     redirect: 'follow',
   })
 
-  const resolvedTag =
-    extractReleaseTagFromUrl(response.url) ??
-    extractReleaseTagFromUrl(response.headers.get('location') ?? '')
-
-  if (resolvedTag) {
-    return resolvedTag
+  if (!response.ok) {
+    throw new Error(`获取 CLIProxyAPI 最新发布失败：HTTP ${response.status}`)
   }
 
-  throw new Error('无法解析 CLIProxyAPI 最新发布版本。')
+  const payload = asObject(await response.json())
+  const tag =
+    normalizeStringValue(payload.tag_name) ??
+    normalizeStringValue(payload.name) ??
+    normalizeStringValue(payload.tag) ??
+    null
+
+  if (!tag) {
+    throw new Error('无法解析 CLIProxyAPI 最新发布版本。')
+  }
+
+  const descriptor = getReleaseAssetDescriptor(tag)
+  const assets = asArray<PlainObject>(payload.assets)
+    .map((entry) => {
+      const name = normalizeStringValue(entry.name)
+      const downloadUrl = normalizeStringValue(
+        entry.browser_download_url ?? entry.browserDownloadUrl,
+      )
+
+      if (!name || !downloadUrl) {
+        return null
+      }
+
+      return { name, downloadUrl }
+    })
+    .filter((value): value is { name: string; downloadUrl: string } => value !== null)
+  const matchedAsset = findReleaseAssetFromApi(assets)
+
+  if (!matchedAsset) {
+    return descriptor
+  }
+
+  return {
+    ...descriptor,
+    assetName: matchedAsset.name,
+    downloadUrl: matchedAsset.downloadUrl,
+  }
 }
 
 function resolveBinaryInstallTargetPath(
@@ -1542,8 +1569,7 @@ async function refreshProxyBinaryState(): Promise<void> {
     await syncProxyBinaryLocalState(effectiveBinaryPath)
 
     try {
-      const latestTag = await fetchLatestReleaseTag()
-      const descriptor = getReleaseAssetDescriptor(latestTag)
+      const descriptor = await fetchLatestReleaseDescriptor()
 
       proxyBinaryState.latestTag = descriptor.tag
       proxyBinaryState.latestVersion = descriptor.version
@@ -1585,8 +1611,7 @@ async function updateProxyBinaryInternal(): Promise<string> {
       proxyBinaryState.lastCheckedAt = new Date().toISOString()
       proxyBinaryState.lastError = null
 
-      const latestTag = await fetchLatestReleaseTag()
-      const descriptor = getReleaseAssetDescriptor(latestTag)
+      const descriptor = await fetchLatestReleaseDescriptor()
       const targetPath = resolveBinaryInstallTargetPath(
         guiState,
         effectiveBinaryPath,
