@@ -2,6 +2,7 @@ import {
   BarChart3,
   Bot,
   CircleAlert,
+  Download,
   ExternalLink,
   FolderOpen,
   HardDriveUpload,
@@ -29,6 +30,7 @@ import type {
   AuthFileQuotaSummary,
   AuthFileRecord,
   DesktopAppState,
+  FetchProviderModelsInput,
   GeminiProviderRecord,
   OpenAICompatibleProviderRecord,
   ProviderApiKeyEntry,
@@ -1515,6 +1517,46 @@ function App() {
     setProviderEditor(null)
   }
 
+  async function fetchModelsForProviderEditor() {
+    if (!providerEditor || providerEditor.kind === 'ampcode') {
+      return
+    }
+
+    const input: FetchProviderModelsInput =
+      providerEditor.kind === 'openai-compatibility'
+        ? {
+            baseUrl: providerEditor.baseUrl,
+            headers: parseHeadersText(providerEditor.headersText),
+            apiKey:
+              parseApiKeyEntriesText(providerEditor.apiKeyEntriesText).find((entry) => entry.apiKey.trim())?.apiKey ??
+              '',
+          }
+        : {
+            baseUrl: providerEditor.baseUrl,
+            apiKey: providerEditor.apiKey,
+            headers: parseHeadersText(providerEditor.headersText),
+          }
+
+    const models = await runAction(
+      `fetch-provider-models-${providerEditor.kind}`,
+      () => window.cliproxy.fetchProviderModels(input),
+      '已拉取模型列表',
+    )
+
+    const modelsText = models.join('\n')
+
+    setProviderEditor((current) => {
+      if (!current || current.kind === 'ampcode') {
+        return current
+      }
+
+      return {
+        ...current,
+        modelsText,
+      }
+    })
+  }
+
   useEffect(() => {
     mountedRef.current = true
     void loadState()
@@ -2250,6 +2292,19 @@ function App() {
             placeholder="gpt-4o = gpt-4o"
             value={providerEditor.modelsText}
           />
+          <div className="action-row">
+            <button
+              className="ghost-button"
+              disabled={busyAction === `fetch-provider-models-${providerEditor.kind}`}
+              onClick={() => {
+                void fetchModelsForProviderEditor()
+              }}
+              type="button"
+            >
+              <Download size={16} />
+              拉取模型
+            </button>
+          </div>
           <TextAreaField
             help="每行一个 Key 条目，格式 apiKey | proxyUrl | HeaderA=1; HeaderB=2。"
             label="API Key 条目"
@@ -2428,6 +2483,19 @@ function App() {
           placeholder="claude-sonnet-4-5"
           value={providerEditor.modelsText}
         />
+        <div className="action-row">
+          <button
+            className="ghost-button"
+            disabled={busyAction === `fetch-provider-models-${providerEditor.kind}`}
+            onClick={() => {
+              void fetchModelsForProviderEditor()
+            }}
+            type="button"
+          >
+            <Download size={16} />
+            拉取模型
+          </button>
+        </div>
         <TextAreaField
           help="每行一个要排除的模型名。"
           label="排除模型"
