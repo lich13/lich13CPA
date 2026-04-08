@@ -1409,20 +1409,22 @@ function extractReleaseTagFromUrl(input: string): string | null {
 async function fetchLatestReleaseTagFromRedirect(): Promise<string> {
   const requestInit = {
     headers: {
-      Accept: 'text/html,application/xhtml+xml',
+      Accept: 'application/vnd.github+json',
       'User-Agent': 'CLIProxy Desktop',
     },
+    redirect: 'follow',
+  })
+
+  if (!response.ok) {
+    throw new Error(`获取 CLIProxyAPI 最新发布失败：HTTP ${response.status}`)
   }
 
-  try {
-    const response = await fetch(CLIPROXY_RELEASES_LATEST_URL, {
-      ...requestInit,
-      method: 'HEAD',
-      redirect: 'manual',
-    })
-    const resolvedTag =
-      extractReleaseTagFromUrl(response.headers.get('location') ?? '') ??
-      extractReleaseTagFromUrl(response.url)
+  const payload = asObject(await response.json())
+  const tag =
+    normalizeStringValue(payload.tag_name) ??
+    normalizeStringValue(payload.name) ??
+    normalizeStringValue(payload.tag) ??
+    null
 
     if (resolvedTag) {
       return resolvedTag
