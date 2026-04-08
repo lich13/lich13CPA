@@ -2128,10 +2128,10 @@ function ensureRequiredConfigFields(config: PlainObject): void {
   )
 }
 
-function applyKnownSettings(
+async function applyKnownSettings(
   config: PlainObject,
   input: SaveKnownSettingsInput,
-): void {
+): Promise<void> {
   ensureRequiredConfigFields(config)
 
   config.port = clampPort(input.port)
@@ -2152,7 +2152,16 @@ function applyKnownSettings(
   config[DESKTOP_METADATA_KEY] = desktop
 
   if (input.useSystemProxy) {
-    config['proxy-url'] = readString(config['proxy-url'])
+    const systemProxyUrl = await detectSystemProxyUrl()
+    const existingProxyUrl = readString(config['proxy-url']).trim()
+
+    if (systemProxyUrl) {
+      config['proxy-url'] = systemProxyUrl
+    } else if (existingProxyUrl) {
+      config['proxy-url'] = existingProxyUrl
+    } else {
+      delete config['proxy-url']
+    }
   } else {
     const nextProxyUrl = input.proxyUrl.trim()
 
@@ -4044,6 +4053,67 @@ async function detectSystemProxyUrl(): Promise<string> {
     return envProxy.trim()
   }
 
+  if (process.platform === 'darwin') {
+    try {
+      const { stdout } = await execFileAsync('scutil', ['--proxy'])
+      const pairs = new Map<string, string>()
+
+      for (const line of stdout.split(/\r?\n/)) {
+        const match = line.match(/^\s*([A-Za-z0-9_]+)\s*:\s*(.+)\s*$/)
+
+        if (!match) {
+          continue
+        }
+
+        pairs.set(match[1], match[2].trim())
+      }
+
+      const readEnabled = (key: string): boolean => {
+        const value = pairs.get(key)
+        return value === '1' || value?.toLowerCase() === 'true'
+      }
+      const readEndpoint = (hostKey: string, portKey: string): string | null => {
+        const host = pairs.get(hostKey)?.trim()
+        const port = pairs.get(portKey)?.trim()
+
+        if (!host) {
+          return null
+        }
+
+        const normalizedPort = port && /^\d+$/.test(port) ? `:${port}` : ''
+        return `${host}${normalizedPort}`
+      }
+
+      if (readEnabled('HTTPEnable')) {
+        const endpoint = readEndpoint('HTTPProxy', 'HTTPPort')
+
+        if (endpoint) {
+          return `http://${endpoint}`
+        }
+      }
+
+      if (readEnabled('HTTPSEnable')) {
+        const endpoint = readEndpoint('HTTPSProxy', 'HTTPSPort')
+
+        if (endpoint) {
+          return `http://${endpoint}`
+        }
+      }
+
+      if (readEnabled('SOCKSEnable')) {
+        const endpoint = readEndpoint('SOCKSProxy', 'SOCKSPort')
+
+        if (endpoint) {
+          return `socks5://${endpoint}`
+        }
+      }
+    } catch {
+      return ''
+    }
+
+    return ''
+  }
+
   if (process.platform !== 'win32') {
     return ''
   }
@@ -4100,6 +4170,34 @@ async function detectSystemProxyUrl(): Promise<string> {
 
         return `http://${candidate}`
       }
+    }
+
+    if (/^[a-z]+:\/\//i.test(rawProxy)) {
+      return rawProxy
+    }
+
+    return `http://${rawProxy}`
+  } catch {
+    // Fall through to winhttp fallback.
+  }
+
+  try {
+    const { stdout } = await execFileAsync('netsh', ['winhttp', 'show', 'proxy'], {
+      windowsHide: true,
+    })
+    const lines = stdout.split(/\r?\n/).map((line) => line.trim())
+    const proxyLine =
+      lines.find((line) => /^Proxy Server\(s\)\s*:/i.test(line)) ??
+      lines.find((line) => /^代理服务器\s*:/i.test(line))
+
+    if (!proxyLine) {
+      return ''
+    }
+
+    const rawProxy = proxyLine.replace(/^.*?:\s*/, '').trim()
+
+    if (!rawProxy || /direct access/i.test(rawProxy) || /直接访问/i.test(rawProxy)) {
+      return ''
     }
 
     if (/^[a-z]+:\/\//i.test(rawProxy)) {
@@ -7604,7 +7702,7 @@ function registerIpcHandlersV2(): void {
     'cliproxy:saveKnownSettings',
     async (_event, input: SaveKnownSettingsInput) => {
       const config = parseConfigObjectV2(await readConfigText())
-      applyKnownSettings(config, input)
+      await applyKnownSettings(config, input)
       await writeConfigObjectV2(config)
       const nextGuiState = await writeGuiState({
         reasoningEffort: input.reasoningEffort,
@@ -8289,7 +8387,7 @@ function registerIpcHandlers(): void {
     'cliproxy:saveKnownSettings',
     async (_event, input: SaveKnownSettingsInput) => {
       const config = parseConfigObject(await readConfigText())
-      applyKnownSettings(config, input)
+      await applyKnownSettings(config, input)
       await writeConfigObject(config)
       await writeGuiState({
         reasoningEffort: input.reasoningEffort,
