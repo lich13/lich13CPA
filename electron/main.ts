@@ -5910,6 +5910,48 @@ async function notifyProxyAuthFilesChangedV2(): Promise<void> {
   }
 }
 
+async function patchAuthFileStatusViaManagementV2(
+  runtime: { managementApiKey: string; port: number },
+  fileName: string,
+  disabled: boolean,
+): Promise<void> {
+  const requestUrl = `${buildManagementApiBaseUrl(runtime.port)}/v0/management/auth-files/status`
+  let lastError: Error | null = null
+
+  for (const headers of buildManagementHeaderCandidates(runtime.managementApiKey)) {
+    try {
+      const response = await fetch(requestUrl, {
+        method: 'PATCH',
+        headers: {
+          ...headers,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: fileName,
+          disabled,
+        }),
+        signal: AbortSignal.timeout(5000),
+      })
+
+      if (response.status === 401) {
+        lastError = new Error('管理密钥无效。')
+        continue
+      }
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`)
+      }
+
+      return
+    } catch (error) {
+      lastError =
+        error instanceof Error ? error : new Error(typeof error === 'string' ? error : '请求失败。')
+    }
+  }
+
+  throw lastError ?? new Error('管理接口请求失败。')
+}
+
 async function ensureProxyReadyForProviderAuthV2(): Promise<void> {
   if (proxyStatus.running && proxyChild && proxyChild.exitCode === null) {
     return
@@ -7938,16 +7980,42 @@ function registerIpcHandlersV2(): void {
   })
 
   ipcMain.handle('cliproxy:toggleAuthFile', async (_event, fileName: string) => {
-    const sourcePath = resolveInsideDirectory(resolvePaths().authDir, fileName)
     const willEnable = isDisabledAuthFile(fileName)
-    const nextName = willEnable ? toEnabledAuthName(fileName) : toDisabledAuthName(fileName)
-    const targetPath = resolveInsideDirectory(resolvePaths().authDir, nextName)
+    const nextDisabled = !willEnable
 
-    if (await pathExists(targetPath)) {
-      throw new Error(`目标文件已存在：${nextName}`)
+    if (proxyStatus.running) {
+      try {
+        const runtime = await resolveManagementRuntimeV2()
+        await patchAuthFileStatusViaManagementV2(runtime, fileName, nextDisabled)
+      } catch (error) {
+        await appendLog(
+          'warn',
+          'app',
+          `管理端切换认证文件状态失败，回退为重命名方案：${toErrorMessage(error)}`,
+        )
+
+        const sourcePath = resolveInsideDirectory(resolvePaths().authDir, fileName)
+        const nextName = willEnable ? toEnabledAuthName(fileName) : toDisabledAuthName(fileName)
+        const targetPath = resolveInsideDirectory(resolvePaths().authDir, nextName)
+
+        if (await pathExists(targetPath)) {
+          throw new Error(`目标文件已存在：${nextName}`)
+        }
+
+        await fs.rename(sourcePath, targetPath)
+      }
+    } else {
+      const sourcePath = resolveInsideDirectory(resolvePaths().authDir, fileName)
+      const nextName = willEnable ? toEnabledAuthName(fileName) : toDisabledAuthName(fileName)
+      const targetPath = resolveInsideDirectory(resolvePaths().authDir, nextName)
+
+      if (await pathExists(targetPath)) {
+        throw new Error(`目标文件已存在：${nextName}`)
+      }
+
+      await fs.rename(sourcePath, targetPath)
     }
 
-    await fs.rename(sourcePath, targetPath)
     await appendLog('info', 'app', `认证文件已${willEnable ? '启用' : '禁用'}：${fileName}`)
     await notifyProxyAuthFilesChangedV2()
     return buildAppStateV2()
