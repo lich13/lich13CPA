@@ -86,7 +86,6 @@ const MIN_USAGE_LOG_FILE_AGE_MS = 1500
 const MAX_USAGE_PROCESSED_FILE_IDS = 6000
 const MAX_LOG_ENTRIES = 600
 const CLIPROXY_REPOSITORY = 'router-for-me/CLIProxyAPI'
-const CLIPROXY_RELEASES_LATEST_URL = `https://github.com/${CLIPROXY_REPOSITORY}/releases/latest`
 const CLIPROXY_RELEASES_LATEST_API_URL = `https://api.github.com/repos/${CLIPROXY_REPOSITORY}/releases/latest`
 const DEFAULT_ANTIGRAVITY_PROJECT_ID = 'bamboo-precept-lgxtn'
 const ANTIGRAVITY_QUOTA_URLS = [
@@ -1401,13 +1400,8 @@ function findReleaseAssetFromApi(
   return null
 }
 
-function extractReleaseTagFromUrl(input: string): string | null {
-  const match = input.match(/\/releases\/tag\/([^/?#]+)/i)
-  return match?.[1] ?? null
-}
-
-async function fetchLatestReleaseTagFromRedirect(): Promise<string> {
-  const requestInit = {
+async function fetchLatestReleaseDescriptor(): Promise<ReleaseAssetDescriptor> {
+  const response = await fetch(CLIPROXY_RELEASES_LATEST_API_URL, {
     headers: {
       Accept: 'application/vnd.github+json',
       'User-Agent': 'CLIProxy Desktop',
@@ -1426,95 +1420,35 @@ async function fetchLatestReleaseTagFromRedirect(): Promise<string> {
     normalizeStringValue(payload.tag) ??
     null
 
-    if (resolvedTag) {
-      return resolvedTag
-    }
-  } catch {
-    // Fall through to GET fallback.
-  }
-
-  const response = await fetch(CLIPROXY_RELEASES_LATEST_URL, {
-    ...requestInit,
-    method: 'GET',
-    redirect: 'follow',
-  })
-  const resolvedTag =
-    extractReleaseTagFromUrl(response.url) ??
-    extractReleaseTagFromUrl(response.headers.get('location') ?? '')
-
-  if (!resolvedTag) {
+  if (!tag) {
     throw new Error('无法解析 CLIProxyAPI 最新发布版本。')
   }
 
-  return resolvedTag
-}
+  const descriptor = getReleaseAssetDescriptor(tag)
+  const assets = asArray<PlainObject>(payload.assets)
+    .map((entry) => {
+      const name = normalizeStringValue(entry.name)
+      const downloadUrl = normalizeStringValue(
+        entry.browser_download_url ?? entry.browserDownloadUrl,
+      )
 
-async function fetchLatestReleaseDescriptor(): Promise<ReleaseAssetDescriptor> {
-  let apiError: string | null = null
+      if (!name || !downloadUrl) {
+        return null
+      }
 
-  try {
-    const response = await fetch(CLIPROXY_RELEASES_LATEST_API_URL, {
-      headers: {
-        Accept: 'application/vnd.github+json',
-        'User-Agent': 'CLIProxy Desktop',
-      },
-      redirect: 'follow',
+      return { name, downloadUrl }
     })
+    .filter((value): value is { name: string; downloadUrl: string } => value !== null)
+  const matchedAsset = findReleaseAssetFromApi(assets)
 
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
-    }
-
-    const payload = asObject(await response.json())
-    const tag =
-      normalizeStringValue(payload.tag_name) ??
-      normalizeStringValue(payload.name) ??
-      normalizeStringValue(payload.tag) ??
-      null
-
-    if (!tag) {
-      throw new Error('缺少 tag_name')
-    }
-
-    const descriptor = getReleaseAssetDescriptor(tag)
-    const assets = asArray<PlainObject>(payload.assets)
-      .map((entry) => {
-        const name = normalizeStringValue(entry.name)
-        const downloadUrl = normalizeStringValue(
-          entry.browser_download_url ?? entry.browserDownloadUrl,
-        )
-
-        if (!name || !downloadUrl) {
-          return null
-        }
-
-        return { name, downloadUrl }
-      })
-      .filter((value): value is { name: string; downloadUrl: string } => value !== null)
-    const matchedAsset = findReleaseAssetFromApi(assets)
-
-    if (!matchedAsset) {
-      return descriptor
-    }
-
-    return {
-      ...descriptor,
-      assetName: matchedAsset.name,
-      downloadUrl: matchedAsset.downloadUrl,
-    }
-  } catch (error) {
-    apiError = toErrorMessage(error)
+  if (!matchedAsset) {
+    return descriptor
   }
 
-  try {
-    const tag = await fetchLatestReleaseTagFromRedirect()
-    return getReleaseAssetDescriptor(tag)
-  } catch (error) {
-    throw new Error(
-      `无法获取 CLIProxyAPI 最新版本（API: ${apiError ?? '未知错误'}；Redirect: ${toErrorMessage(
-        error,
-      )}）`,
-    )
+  return {
+    ...descriptor,
+    assetName: matchedAsset.name,
+    downloadUrl: matchedAsset.downloadUrl,
   }
 }
 
@@ -2128,10 +2062,10 @@ function ensureRequiredConfigFields(config: PlainObject): void {
   )
 }
 
-async function applyKnownSettings(
+function applyKnownSettings(
   config: PlainObject,
   input: SaveKnownSettingsInput,
-): Promise<void> {
+): void {
   ensureRequiredConfigFields(config)
 
   config.port = clampPort(input.port)
@@ -2152,16 +2086,7 @@ async function applyKnownSettings(
   config[DESKTOP_METADATA_KEY] = desktop
 
   if (input.useSystemProxy) {
-    const systemProxyUrl = await detectSystemProxyUrl()
-    const existingProxyUrl = readString(config['proxy-url']).trim()
-
-    if (systemProxyUrl) {
-      config['proxy-url'] = systemProxyUrl
-    } else if (existingProxyUrl) {
-      config['proxy-url'] = existingProxyUrl
-    } else {
-      delete config['proxy-url']
-    }
+    config['proxy-url'] = readString(config['proxy-url'])
   } else {
     const nextProxyUrl = input.proxyUrl.trim()
 
@@ -4053,67 +3978,6 @@ async function detectSystemProxyUrl(): Promise<string> {
     return envProxy.trim()
   }
 
-  if (process.platform === 'darwin') {
-    try {
-      const { stdout } = await execFileAsync('scutil', ['--proxy'])
-      const pairs = new Map<string, string>()
-
-      for (const line of stdout.split(/\r?\n/)) {
-        const match = line.match(/^\s*([A-Za-z0-9_]+)\s*:\s*(.+)\s*$/)
-
-        if (!match) {
-          continue
-        }
-
-        pairs.set(match[1], match[2].trim())
-      }
-
-      const readEnabled = (key: string): boolean => {
-        const value = pairs.get(key)
-        return value === '1' || value?.toLowerCase() === 'true'
-      }
-      const readEndpoint = (hostKey: string, portKey: string): string | null => {
-        const host = pairs.get(hostKey)?.trim()
-        const port = pairs.get(portKey)?.trim()
-
-        if (!host) {
-          return null
-        }
-
-        const normalizedPort = port && /^\d+$/.test(port) ? `:${port}` : ''
-        return `${host}${normalizedPort}`
-      }
-
-      if (readEnabled('HTTPEnable')) {
-        const endpoint = readEndpoint('HTTPProxy', 'HTTPPort')
-
-        if (endpoint) {
-          return `http://${endpoint}`
-        }
-      }
-
-      if (readEnabled('HTTPSEnable')) {
-        const endpoint = readEndpoint('HTTPSProxy', 'HTTPSPort')
-
-        if (endpoint) {
-          return `http://${endpoint}`
-        }
-      }
-
-      if (readEnabled('SOCKSEnable')) {
-        const endpoint = readEndpoint('SOCKSProxy', 'SOCKSPort')
-
-        if (endpoint) {
-          return `socks5://${endpoint}`
-        }
-      }
-    } catch {
-      return ''
-    }
-
-    return ''
-  }
-
   if (process.platform !== 'win32') {
     return ''
   }
@@ -4170,34 +4034,6 @@ async function detectSystemProxyUrl(): Promise<string> {
 
         return `http://${candidate}`
       }
-    }
-
-    if (/^[a-z]+:\/\//i.test(rawProxy)) {
-      return rawProxy
-    }
-
-    return `http://${rawProxy}`
-  } catch {
-    // Fall through to winhttp fallback.
-  }
-
-  try {
-    const { stdout } = await execFileAsync('netsh', ['winhttp', 'show', 'proxy'], {
-      windowsHide: true,
-    })
-    const lines = stdout.split(/\r?\n/).map((line) => line.trim())
-    const proxyLine =
-      lines.find((line) => /^Proxy Server\(s\)\s*:/i.test(line)) ??
-      lines.find((line) => /^代理服务器\s*:/i.test(line))
-
-    if (!proxyLine) {
-      return ''
-    }
-
-    const rawProxy = proxyLine.replace(/^.*?:\s*/, '').trim()
-
-    if (!rawProxy || /direct access/i.test(rawProxy) || /直接访问/i.test(rawProxy)) {
-      return ''
     }
 
     if (/^[a-z]+:\/\//i.test(rawProxy)) {
@@ -7702,7 +7538,7 @@ function registerIpcHandlersV2(): void {
     'cliproxy:saveKnownSettings',
     async (_event, input: SaveKnownSettingsInput) => {
       const config = parseConfigObjectV2(await readConfigText())
-      await applyKnownSettings(config, input)
+      applyKnownSettings(config, input)
       await writeConfigObjectV2(config)
       const nextGuiState = await writeGuiState({
         reasoningEffort: input.reasoningEffort,
@@ -8387,7 +8223,7 @@ function registerIpcHandlers(): void {
     'cliproxy:saveKnownSettings',
     async (_event, input: SaveKnownSettingsInput) => {
       const config = parseConfigObject(await readConfigText())
-      await applyKnownSettings(config, input)
+      applyKnownSettings(config, input)
       await writeConfigObject(config)
       await writeGuiState({
         reasoningEffort: input.reasoningEffort,
