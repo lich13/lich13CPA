@@ -3813,6 +3813,18 @@ function indexRemoteAuthFilesByName(entries: PlainObject[]): Map<string, PlainOb
   return indexed
 }
 
+function isRemoteAuthFileDisabled(entry: PlainObject): boolean {
+  const status = normalizeStringValue(entry.status)?.toLowerCase()
+
+  return (
+    readBoolean(entry.disabled, false) ||
+    readBoolean(entry.is_disabled ?? entry.isDisabled, false) ||
+    status === 'disabled' ||
+    status === 'inactive' ||
+    status === 'suspended'
+  )
+}
+
 function pickLaterTimestamp(current: string | null, next: string | null): string | null {
   if (!current) {
     return next
@@ -3944,6 +3956,7 @@ function mergeRemoteAuthFileRecord(
     authIndex,
     label: normalizeStringValue(remoteEntry.label) || localRecord.label,
     source: normalizeStringValue(remoteEntry.source) || localRecord.source,
+    enabled: !isRemoteAuthFileDisabled(remoteEntry),
     status: normalizeStringValue(remoteEntry.status) || localRecord.status,
     statusMessage:
       normalizeStringValue(remoteEntry.status_message ?? remoteEntry.statusMessage) ||
@@ -5950,6 +5963,43 @@ async function patchAuthFileStatusViaManagementV2(
   }
 
   throw lastError ?? new Error('管理接口请求失败。')
+}
+
+async function resolveRemoteAuthFileEnabledStateV2(
+  runtime: { managementApiKey: string; port: number },
+  fileName: string,
+): Promise<boolean | null> {
+  const payload = await fetchManagementJsonCompatV2<PlainObject>(
+    runtime.port,
+    runtime.managementApiKey,
+    '/v0/management/auth-files',
+  )
+  const entries = extractRemoteAuthFileEntries(payload)
+  const normalizedName = fileName.trim().toLowerCase()
+  const normalizedEnabledName = toEnabledAuthName(fileName).trim().toLowerCase()
+  const normalizedDisabledName = toDisabledAuthName(fileName).trim().toLowerCase()
+
+  const target = entries.find((entry) => {
+    const candidates = [
+      normalizeRemoteAuthFileBaseName(entry.name),
+      normalizeRemoteAuthFileBaseName(entry.id),
+      normalizeRemoteAuthFileBaseName(entry.path),
+    ]
+      .filter((value): value is string => Boolean(value))
+      .map((value) => value.toLowerCase())
+
+    return (
+      candidates.includes(normalizedName) ||
+      candidates.includes(normalizedEnabledName) ||
+      candidates.includes(normalizedDisabledName)
+    )
+  })
+
+  if (!target) {
+    return null
+  }
+
+  return !isRemoteAuthFileDisabled(target)
 }
 
 async function ensureProxyReadyForProviderAuthV2(): Promise<void> {
@@ -7980,13 +8030,22 @@ function registerIpcHandlersV2(): void {
   })
 
   ipcMain.handle('cliproxy:toggleAuthFile', async (_event, fileName: string) => {
-    const willEnable = isDisabledAuthFile(fileName)
-    const nextDisabled = !willEnable
+    const localEnabled = !isDisabledAuthFile(fileName)
+    let currentEnabled = localEnabled
 
     if (proxyStatus.running) {
       try {
         const runtime = await resolveManagementRuntimeV2()
+        const remoteEnabled = await resolveRemoteAuthFileEnabledStateV2(runtime, fileName)
+
+        if (typeof remoteEnabled === 'boolean') {
+          currentEnabled = remoteEnabled
+        }
+
+        const willEnable = !currentEnabled
+        const nextDisabled = !willEnable
         await patchAuthFileStatusViaManagementV2(runtime, fileName, nextDisabled)
+        await appendLog('info', 'app', `认证文件已${willEnable ? '启用' : '禁用'}：${fileName}`)
       } catch (error) {
         await appendLog(
           'warn',
@@ -7995,6 +8054,7 @@ function registerIpcHandlersV2(): void {
         )
 
         const sourcePath = resolveInsideDirectory(resolvePaths().authDir, fileName)
+        const willEnable = isDisabledAuthFile(fileName)
         const nextName = willEnable ? toEnabledAuthName(fileName) : toDisabledAuthName(fileName)
         const targetPath = resolveInsideDirectory(resolvePaths().authDir, nextName)
 
@@ -8003,8 +8063,10 @@ function registerIpcHandlersV2(): void {
         }
 
         await fs.rename(sourcePath, targetPath)
+        await appendLog('info', 'app', `认证文件已${willEnable ? '启用' : '禁用'}：${fileName}`)
       }
     } else {
+      const willEnable = isDisabledAuthFile(fileName)
       const sourcePath = resolveInsideDirectory(resolvePaths().authDir, fileName)
       const nextName = willEnable ? toEnabledAuthName(fileName) : toDisabledAuthName(fileName)
       const targetPath = resolveInsideDirectory(resolvePaths().authDir, nextName)
@@ -8014,9 +8076,9 @@ function registerIpcHandlersV2(): void {
       }
 
       await fs.rename(sourcePath, targetPath)
+      await appendLog('info', 'app', `认证文件已${willEnable ? '启用' : '禁用'}：${fileName}`)
     }
 
-    await appendLog('info', 'app', `认证文件已${willEnable ? '启用' : '禁用'}：${fileName}`)
     await notifyProxyAuthFilesChangedV2()
     return buildAppStateV2()
   })
