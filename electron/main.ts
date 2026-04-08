@@ -250,6 +250,7 @@ const OPUS_THINKING_MODELS = [
 const MANAGED_THINKING_MODEL_NAMES = new Set(
   [...SONNET_THINKING_MODELS, ...OPUS_THINKING_MODELS].map((model) => model.name),
 )
+const MANAGED_REASONING_EFFORT_MARKER = 'x-cliproxy-desktop-reasoning-effort'
 
 type PlainObject = Record<string, unknown>
 type ArchiveKind = 'tar.gz' | 'zip'
@@ -1164,6 +1165,15 @@ function buildManagedThinkingEntries(tokenBudget: number): PlainObject[] {
   ]
 }
 
+function buildManagedReasoningEffortEntry(reasoningEffort: ReasoningEffort): PlainObject {
+  return {
+    params: {
+      'reasoning.effort': reasoningEffort,
+      _managedBy: MANAGED_REASONING_EFFORT_MARKER,
+    },
+  }
+}
+
 function isManagedThinkingEntry(entry: unknown): boolean {
   const entryObject = asObject(entry)
   const params = asObject(entryObject.params)
@@ -1176,6 +1186,13 @@ function isManagedThinkingEntry(entry: unknown): boolean {
   const names = models.map((model) => readString(asObject(model).name)).filter(Boolean)
 
   return names.length > 0 && names.every((name) => MANAGED_THINKING_MODEL_NAMES.has(name))
+}
+
+function isManagedReasoningEffortEntry(entry: unknown): boolean {
+  const entryObject = asObject(entry)
+  const params = asObject(entryObject.params)
+
+  return readString(params._managedBy) === MANAGED_REASONING_EFFORT_MARKER
 }
 
 function createDefaultConfig(): PlainObject {
@@ -1206,7 +1223,10 @@ function createDefaultConfig(): PlainObject {
       'disable-control-panel': false,
     },
     payload: {
-      default: buildManagedThinkingEntries(8192),
+      default: [
+        ...buildManagedThinkingEntries(8192),
+        buildManagedReasoningEffortEntry(defaultGuiState.reasoningEffort),
+      ],
     },
     [DESKTOP_METADATA_KEY]: {
       'use-system-proxy': false,
@@ -1250,6 +1270,10 @@ function computeProxyBinaryUpdateAvailable(
   }
 
   if (!hasBinary) {
+    return true
+  }
+
+  if (!currentVersion) {
     return true
   }
 
@@ -1885,6 +1909,26 @@ function applyThinkingBudget(
   config[DESKTOP_METADATA_KEY] = desktop
 }
 
+function extractReasoningEffort(config: PlainObject, guiState: GuiState): ReasoningEffort {
+  const payload = asObject(config.payload)
+  const payloadDefaults = asArray<PlainObject>(payload.default)
+  const managedEntry = payloadDefaults.find(isManagedReasoningEffortEntry)
+  const managedParams = asObject(managedEntry?.params)
+  const reasoningEffort = readString(managedParams['reasoning.effort']) as ReasoningEffort
+
+  if (
+    reasoningEffort === 'minimal' ||
+    reasoningEffort === 'low' ||
+    reasoningEffort === 'medium' ||
+    reasoningEffort === 'high' ||
+    reasoningEffort === 'xhigh'
+  ) {
+    return reasoningEffort
+  }
+
+  return guiState.reasoningEffort
+}
+
 function extractKnownSettings(config: PlainObject, guiState: GuiState): KnownSettings {
   const thinkingBudget = extractThinkingBudget(config)
   const desktop = getDesktopMetadata(config)
@@ -1920,7 +1964,7 @@ function extractKnownSettings(config: PlainObject, guiState: GuiState): KnownSet
     ),
     thinkingBudgetMode: thinkingBudget.mode,
     thinkingBudgetCustom: thinkingBudget.customBudget,
-    reasoningEffort: guiState.reasoningEffort,
+    reasoningEffort: extractReasoningEffort(config, guiState),
     autoSyncOnStop: guiState.autoSyncOnStop,
     launchAtLogin: guiState.launchAtLogin,
     autoStartProxyOnLaunch: guiState.autoStartProxyOnLaunch,
@@ -2040,6 +2084,17 @@ function applyKnownSettings(
   config.streaming = streaming
 
   applyThinkingBudget(config, input.thinkingBudgetMode, input.thinkingBudgetCustom)
+  applyReasoningEffort(config, input.reasoningEffort)
+}
+
+function applyReasoningEffort(config: PlainObject, reasoningEffort: ReasoningEffort): void {
+  const payload = asObject(config.payload)
+  const payloadDefaults = asArray<PlainObject>(payload.default).filter(
+    (entry) => !isManagedReasoningEffortEntry(entry),
+  )
+
+  payload.default = [buildManagedReasoningEffortEntry(reasoningEffort), ...payloadDefaults]
+  config.payload = payload
 }
 
 function normalizeProviderModels(models: ProviderModelMapping[]): ProviderModelMapping[] {
