@@ -147,6 +147,7 @@ interface TextAreaFieldProps {
 
 interface ToggleFieldProps {
   checked: boolean
+  disabled?: boolean
   help: string
   label: string
   onChange: (checked: boolean) => void
@@ -326,7 +327,7 @@ function TextAreaField({
   )
 }
 
-function ToggleField({ checked, help, label, onChange }: ToggleFieldProps) {
+function ToggleField({ checked, disabled, help, label, onChange }: ToggleFieldProps) {
   return (
     <label className="toggle-field">
       <span className="toggle-copy">
@@ -335,6 +336,7 @@ function ToggleField({ checked, help, label, onChange }: ToggleFieldProps) {
       </span>
       <button
         className={`toggle-button ${checked ? 'on' : ''}`}
+        disabled={disabled}
         onClick={() => onChange(!checked)}
         type="button"
       >
@@ -695,7 +697,7 @@ function parseOptionalInteger(value: string): number | null {
 
 function parseModelsText(value: string): ProviderModelMapping[] {
   return parseLines(value).map((line) => {
-    const separatorIndex = line.indexOf('=')
+    const separatorIndex = line.includes('=') ? line.indexOf('=') : line.indexOf(',')
 
     if (separatorIndex === -1) {
       return {
@@ -999,6 +1001,8 @@ function App() {
   const [usageLoading, setUsageLoading] = useState(false)
   const [settingsDirty, setSettingsDirty] = useState(false)
   const [settingsDraft, setSettingsDraft] = useState<SaveKnownSettingsInput>(EMPTY_SETTINGS)
+  const [fetchedModels, setFetchedModels] = useState<string[]>([])
+  const [selectedFetchedModels, setSelectedFetchedModels] = useState<Record<string, string>>({})
   const mountedRef = useRef(true)
   const quotaRequestedRef = useRef(new Set<string>())
   const authPollTimerRef = useRef<Record<string, number>>({})
@@ -1542,9 +1546,13 @@ function App() {
       () => window.cliproxy.fetchProviderModels(input),
       '已拉取模型列表',
     )
+    setFetchedModels(models)
+    setSelectedFetchedModels({})
+  }
 
-    const modelsText = models.join('\n')
-
+  function updateProviderEditorModels(
+    updater: (models: ProviderModelMapping[]) => ProviderModelMapping[],
+  ) {
     setProviderEditor((current) => {
       if (!current || current.kind === 'ampcode') {
         return current
@@ -1552,9 +1560,33 @@ function App() {
 
       return {
         ...current,
-        modelsText,
+        modelsText: stringifyModels(updater(parseModelsText(current.modelsText))),
       }
     })
+  }
+
+  function appendSelectedFetchedModels() {
+    const picked = Object.entries(selectedFetchedModels)
+      .filter(([, checked]) => checked === '1')
+      .map(([name]) => name)
+
+    if (picked.length === 0) {
+      pushNotice('error', '请先勾选至少一个模型。')
+      return
+    }
+
+    updateProviderEditorModels((models) => {
+      const existingByName = new Map(models.map((model) => [model.name, model]))
+
+      picked.forEach((name) => {
+        if (!existingByName.has(name)) {
+          existingByName.set(name, { name, alias: name })
+        }
+      })
+
+      return Array.from(existingByName.values())
+    })
+    pushNotice('success', `已添加 ${picked.length} 个模型。`)
   }
 
   useEffect(() => {
@@ -1579,6 +1611,11 @@ function App() {
       })
     }
   }, [])
+
+  useEffect(() => {
+    setFetchedModels([])
+    setSelectedFetchedModels({})
+  }, [providerEditor])
 
   useEffect(() => {
     if (!notice) {
@@ -2280,8 +2317,8 @@ function App() {
             value={providerEditor.headersText}
           />
           <TextAreaField
-            help="每行一个模型，支持 alias = name。"
-            label="模型映射"
+            help="模型映射原始文本。支持 alias = name 或 name, alias。"
+            label="模型映射（高级）"
             onChange={(value) =>
               setProviderEditor((current) =>
                 current && current.kind === 'openai-compatibility'
@@ -2289,9 +2326,60 @@ function App() {
                   : current,
               )
             }
-            placeholder="gpt-4o = gpt-4o"
+            placeholder="gpt-4o-mini, gpt-4o"
             value={providerEditor.modelsText}
           />
+          <div className="model-editor-panel">
+            <div className="model-editor-head">
+              <strong>模型列表（name[, alias]）</strong>
+              <button
+                className="ghost-button"
+                onClick={() => updateProviderEditorModels((models) => [...models, { name: '', alias: '' }])}
+                type="button"
+              >
+                <Plus size={16} />
+                添加模型
+              </button>
+            </div>
+            {parseModelsText(providerEditor.modelsText).map((model, index) => (
+              <div className="model-row" key={`openai-model-${index}`}>
+                <input
+                  className="field-input"
+                  onChange={(event) =>
+                    updateProviderEditorModels((models) =>
+                      models.map((item, itemIndex) =>
+                        itemIndex === index ? { ...item, name: event.target.value } : item,
+                      ),
+                    )
+                  }
+                  placeholder="模型名称"
+                  value={model.name}
+                />
+                <span>→</span>
+                <input
+                  className="field-input"
+                  onChange={(event) =>
+                    updateProviderEditorModels((models) =>
+                      models.map((item, itemIndex) =>
+                        itemIndex === index ? { ...item, alias: event.target.value } : item,
+                      ),
+                    )
+                  }
+                  placeholder="模型别名（可选）"
+                  value={model.alias === model.name ? '' : model.alias}
+                />
+                <button
+                  className="icon-button"
+                  onClick={() =>
+                    updateProviderEditorModels((models) => models.filter((_, itemIndex) => itemIndex !== index))
+                  }
+                  type="button"
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
           <div className="action-row">
             <button
               className="ghost-button"
@@ -2304,7 +2392,31 @@ function App() {
               <Download size={16} />
               拉取模型
             </button>
+            {fetchedModels.length > 0 ? (
+              <button className="ghost-button" onClick={appendSelectedFetchedModels} type="button">
+                添加勾选模型
+              </button>
+            ) : null}
           </div>
+          {fetchedModels.length > 0 ? (
+            <div className="model-pick-grid">
+              {fetchedModels.map((modelName) => (
+                <label className="model-pick-item" key={modelName}>
+                  <input
+                    checked={selectedFetchedModels[modelName] === '1'}
+                    onChange={(event) =>
+                      setSelectedFetchedModels((current) => ({
+                        ...current,
+                        [modelName]: event.target.checked ? '1' : '0',
+                      }))
+                    }
+                    type="checkbox"
+                  />
+                  <span>{modelName}</span>
+                </label>
+              ))}
+            </div>
+          ) : null}
           <TextAreaField
             help="每行一个 Key 条目，格式 apiKey | proxyUrl | HeaderA=1; HeaderB=2。"
             label="API Key 条目"
@@ -2471,8 +2583,8 @@ function App() {
           value={providerEditor.headersText}
         />
         <TextAreaField
-          help="每行一个模型，支持 alias = name。"
-          label="模型映射"
+          help="模型映射原始文本。支持 alias = name 或 name, alias。"
+          label="模型映射（高级）"
           onChange={(value) =>
             setProviderEditor((current) =>
               current && current.kind === providerEditor.kind
@@ -2483,6 +2595,57 @@ function App() {
           placeholder="claude-sonnet-4-5"
           value={providerEditor.modelsText}
         />
+        <div className="model-editor-panel">
+          <div className="model-editor-head">
+            <strong>模型列表（name[, alias]）</strong>
+            <button
+              className="ghost-button"
+              onClick={() => updateProviderEditorModels((models) => [...models, { name: '', alias: '' }])}
+              type="button"
+            >
+              <Plus size={16} />
+              添加模型
+            </button>
+          </div>
+          {parseModelsText(providerEditor.modelsText).map((model, index) => (
+            <div className="model-row" key={`provider-model-${index}`}>
+              <input
+                className="field-input"
+                onChange={(event) =>
+                  updateProviderEditorModels((models) =>
+                    models.map((item, itemIndex) =>
+                      itemIndex === index ? { ...item, name: event.target.value } : item,
+                    ),
+                  )
+                }
+                placeholder="模型名称"
+                value={model.name}
+              />
+              <span>→</span>
+              <input
+                className="field-input"
+                onChange={(event) =>
+                  updateProviderEditorModels((models) =>
+                    models.map((item, itemIndex) =>
+                      itemIndex === index ? { ...item, alias: event.target.value } : item,
+                    ),
+                  )
+                }
+                placeholder="模型别名（可选）"
+                value={model.alias === model.name ? '' : model.alias}
+              />
+              <button
+                className="icon-button"
+                onClick={() =>
+                  updateProviderEditorModels((models) => models.filter((_, itemIndex) => itemIndex !== index))
+                }
+                type="button"
+              >
+                <Trash2 size={14} />
+              </button>
+            </div>
+          ))}
+        </div>
         <div className="action-row">
           <button
             className="ghost-button"
@@ -2495,7 +2658,31 @@ function App() {
             <Download size={16} />
             拉取模型
           </button>
+          {fetchedModels.length > 0 ? (
+            <button className="ghost-button" onClick={appendSelectedFetchedModels} type="button">
+              添加勾选模型
+            </button>
+          ) : null}
         </div>
+        {fetchedModels.length > 0 ? (
+          <div className="model-pick-grid">
+            {fetchedModels.map((modelName) => (
+              <label className="model-pick-item" key={modelName}>
+                <input
+                  checked={selectedFetchedModels[modelName] === '1'}
+                  onChange={(event) =>
+                    setSelectedFetchedModels((current) => ({
+                      ...current,
+                      [modelName]: event.target.checked ? '1' : '0',
+                    }))
+                  }
+                  type="checkbox"
+                />
+                <span>{modelName}</span>
+              </label>
+            ))}
+          </div>
+        ) : null}
         <TextAreaField
           help="每行一个要排除的模型名。"
           label="排除模型"
@@ -2972,19 +3159,6 @@ function App() {
                               <ExternalLink size={16} />
                             </button>
                             <button
-                              className="icon-button"
-                              onClick={() =>
-                                void runStateAction(
-                                  `toggle-auth-${file.name}`,
-                                  () => window.cliproxy.toggleAuthFile(file.name),
-                                  '认证文件状态已切换',
-                                )
-                              }
-                              type="button"
-                            >
-                              {file.enabled ? <Square size={16} /> : <Play size={16} />}
-                            </button>
-                            <button
                               className="icon-button danger"
                               onClick={() =>
                                 void runStateAction(
@@ -3049,6 +3223,23 @@ function App() {
 
                         <div className="auth-card-foot">
                           <span>修改 {formatTime(file.modifiedAt)}</span>
+                          <div className="auth-enable-switch">
+                            <span>启用</span>
+                            <button
+                              className={`toggle-button ${file.enabled ? 'on' : ''}`}
+                              disabled={busyAction === `toggle-auth-${file.name}`}
+                              onClick={() =>
+                                void runStateAction(
+                                  `toggle-auth-${file.name}`,
+                                  () => window.cliproxy.toggleAuthFile(file.name),
+                                  `认证文件已${file.enabled ? '停用' : '启用'}`,
+                                )
+                              }
+                              type="button"
+                            >
+                              <span className="toggle-thumb" />
+                            </button>
+                          </div>
                           <span className="auth-card-path">{file.path}</span>
                         </div>
                       </>
