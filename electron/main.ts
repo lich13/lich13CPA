@@ -1401,6 +1401,62 @@ function findReleaseAssetFromApi(
   return null
 }
 
+function parseReleaseDescriptorFromPayload(payload: PlainObject): ReleaseAssetDescriptor {
+  const tag =
+    normalizeStringValue(payload.tag_name) ??
+    normalizeStringValue(payload.name) ??
+    normalizeStringValue(payload.tag) ??
+    null
+
+  if (!tag) {
+    throw new Error('缺少 tag_name')
+  }
+
+  const descriptor = getReleaseAssetDescriptor(tag)
+  const assets = asArray<PlainObject>(payload.assets)
+    .map((entry) => {
+      const name = normalizeStringValue(entry.name)
+      const downloadUrl = normalizeStringValue(
+        entry.browser_download_url ?? entry.browserDownloadUrl,
+      )
+
+      if (!name || !downloadUrl) {
+        return null
+      }
+
+      return { name, downloadUrl }
+    })
+    .filter((value): value is { name: string; downloadUrl: string } => value !== null)
+  const matchedAsset = findReleaseAssetFromApi(assets)
+
+  if (!matchedAsset) {
+    return descriptor
+  }
+
+  return {
+    ...descriptor,
+    assetName: matchedAsset.name,
+    downloadUrl: matchedAsset.downloadUrl,
+  }
+}
+
+async function fetchLatestReleaseDescriptorFromApiByCurl(): Promise<ReleaseAssetDescriptor> {
+  const { stdout } = await execFileAsync(
+    'curl',
+    [
+      '-fsSL',
+      '-H',
+      'Accept: application/vnd.github+json',
+      '-H',
+      'User-Agent: CLIProxy Desktop',
+      CLIPROXY_RELEASES_LATEST_API_URL,
+    ],
+    { maxBuffer: 5 * 1024 * 1024, windowsHide: true },
+  )
+  const parsed = JSON.parse(stdout) as unknown
+  return parseReleaseDescriptorFromPayload(asObject(parsed))
+}
+
 function extractReleaseTagFromUrl(input: string): string | null {
   const match = input.match(/\/releases\/tag\/([^/?#]+)/i)
   return match?.[1] ?? null
@@ -1449,6 +1505,7 @@ async function fetchLatestReleaseTagFromRedirect(): Promise<string> {
 
 async function fetchLatestReleaseDescriptor(): Promise<ReleaseAssetDescriptor> {
   let apiError: string | null = null
+  let curlApiError: string | null = null
 
   try {
     const response = await fetch(CLIPROXY_RELEASES_LATEST_API_URL, {
@@ -1464,44 +1521,15 @@ async function fetchLatestReleaseDescriptor(): Promise<ReleaseAssetDescriptor> {
     }
 
     const payload = asObject(await response.json())
-    const tag =
-      normalizeStringValue(payload.tag_name) ??
-      normalizeStringValue(payload.name) ??
-      normalizeStringValue(payload.tag) ??
-      null
-
-    if (!tag) {
-      throw new Error('缺少 tag_name')
-    }
-
-    const descriptor = getReleaseAssetDescriptor(tag)
-    const assets = asArray<PlainObject>(payload.assets)
-      .map((entry) => {
-        const name = normalizeStringValue(entry.name)
-        const downloadUrl = normalizeStringValue(
-          entry.browser_download_url ?? entry.browserDownloadUrl,
-        )
-
-        if (!name || !downloadUrl) {
-          return null
-        }
-
-        return { name, downloadUrl }
-      })
-      .filter((value): value is { name: string; downloadUrl: string } => value !== null)
-    const matchedAsset = findReleaseAssetFromApi(assets)
-
-    if (!matchedAsset) {
-      return descriptor
-    }
-
-    return {
-      ...descriptor,
-      assetName: matchedAsset.name,
-      downloadUrl: matchedAsset.downloadUrl,
-    }
+    return parseReleaseDescriptorFromPayload(payload)
   } catch (error) {
     apiError = toErrorMessage(error)
+  }
+
+  try {
+    return await fetchLatestReleaseDescriptorFromApiByCurl()
+  } catch (error) {
+    curlApiError = toErrorMessage(error)
   }
 
   try {
@@ -1509,9 +1537,9 @@ async function fetchLatestReleaseDescriptor(): Promise<ReleaseAssetDescriptor> {
     return getReleaseAssetDescriptor(tag)
   } catch (error) {
     throw new Error(
-      `无法获取 CLIProxyAPI 最新版本（API: ${apiError ?? '未知错误'}；Redirect: ${toErrorMessage(
-        error,
-      )}）`,
+      `无法获取 CLIProxyAPI 最新版本（API: ${
+        apiError ?? '未知错误'
+      }；Curl API: ${curlApiError ?? '未知错误'}；Redirect: ${toErrorMessage(error)}）`,
     )
   }
 }
@@ -1536,20 +1564,50 @@ async function downloadReleaseAsset(
   descriptor: ReleaseAssetDescriptor,
   targetPath: string,
 ): Promise<void> {
-  const response = await fetch(descriptor.downloadUrl, {
-    headers: {
-      Accept: 'application/octet-stream',
-      'User-Agent': 'CLIProxy Desktop',
-    },
-    redirect: 'follow',
-  })
+  try {
+    const response = await fetch(descriptor.downloadUrl, {
+      headers: {
+        Accept: 'application/octet-stream',
+        'User-Agent': 'CLIProxy Desktop',
+      },
+      redirect: 'follow',
+    })
 
-  if (!response.ok) {
-    throw new Error(`下载 ${descriptor.assetName} 失败：HTTP ${response.status}`)
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`)
+    }
+
+    const payload = Buffer.from(await response.arrayBuffer())
+    await fs.writeFile(targetPath, payload)
+  } catch (error) {
+    const fetchError = toErrorMessage(error)
+    try {
+      await execFileAsync(
+        'curl',
+        [
+          '-fL',
+          '--retry',
+          '3',
+          '--retry-delay',
+          '1',
+          '-H',
+          'Accept: application/octet-stream',
+          '-H',
+          'User-Agent: CLIProxy Desktop',
+          '-o',
+          targetPath,
+          descriptor.downloadUrl,
+        ],
+        { maxBuffer: 5 * 1024 * 1024, windowsHide: true },
+      )
+    } catch (curlError) {
+      throw new Error(
+        `下载 ${descriptor.assetName} 失败（fetch: ${fetchError}; curl: ${toErrorMessage(
+          curlError,
+        )})`,
+      )
+    }
   }
-
-  const payload = Buffer.from(await response.arrayBuffer())
-  await fs.writeFile(targetPath, payload)
 }
 
 async function extractArchive(
