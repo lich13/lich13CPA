@@ -3,6 +3,7 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type {
   DeleteAiProviderInput,
   DesktopBridge,
+  FetchProviderModelsInput,
   LogEntry,
   ProviderAuthProvider,
   SaveAiProviderInput,
@@ -38,6 +39,8 @@ const api: DesktopBridge = {
     ipcRenderer.invoke('cliproxy:saveAiProvider', input),
   deleteAiProvider: (input: DeleteAiProviderInput) =>
     ipcRenderer.invoke('cliproxy:deleteAiProvider', input),
+  fetchProviderModels: (input: FetchProviderModelsInput) =>
+    ipcRenderer.invoke('cliproxy:fetchProviderModels', input),
   openPath: (targetPath: string) => ipcRenderer.invoke('cliproxy:openPath', targetPath),
   openExternal: (targetUrl: string) => ipcRenderer.invoke('cliproxy:openExternal', targetUrl),
   clearLogs: () => ipcRenderer.invoke('cliproxy:clearLogs'),

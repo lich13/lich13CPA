@@ -185,6 +185,12 @@ export interface DeleteAiProviderInput {
   index?: number
 }
 
+export interface FetchProviderModelsInput {
+  apiKey?: string
+  baseUrl: string
+  headers?: ProviderHeaderEntry[]
+}
+
 export interface ProviderRecord {
   index: number
   name: string
@@ -427,6 +433,7 @@ export interface DesktopBridge {
   deleteProvider: (index: number) => Promise<DesktopAppState>
   saveAiProvider: (input: SaveAiProviderInput) => Promise<DesktopAppState>
   deleteAiProvider: (input: DeleteAiProviderInput) => Promise<DesktopAppState>
+  fetchProviderModels: (input: FetchProviderModelsInput) => Promise<string[]>
   openPath: (targetPath: string) => Promise<void>
   openExternal: (targetUrl: string) => Promise<void>
   clearLogs: () => Promise<DesktopAppState>
