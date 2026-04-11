@@ -11,6 +11,8 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
@@ -33,9 +35,20 @@ use tempfile::TempDir;
 use url::Url;
 use zip::ZipArchive;
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 pub const STATE_CHANGED_EVENT: &str = "cliproxy://state-changed";
 pub const LOGS_UPDATED_EVENT: &str = "cliproxy://logs-updated";
 pub const OAUTH_CALLBACK_EVENT: &str = "cliproxy://oauth-callback";
+
+#[cfg(target_os = "windows")]
+fn apply_windows_command_flags(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_windows_command_flags(_command: &mut Command) {}
 
 const DESKTOP_METADATA_KEY: &str = "x-cliproxy-desktop";
 const MAIN_LOG_NAME: &str = "main.log";
@@ -530,6 +543,7 @@ impl Backend {
         self.proxy_stop_requested().store(false, Ordering::SeqCst);
 
         let mut child = Command::new(&binary_path);
+        apply_windows_command_flags(&mut child);
         child
             .arg("--config")
             .arg(&self.inner.paths.config_path)
@@ -3054,10 +3068,15 @@ impl Backend {
             }
         }
 
-        let output = Command::new(binary_path)
-            .arg("--help")
-            .output()
-            .or_else(|_| Command::new(binary_path).output())?;
+        let output = {
+            let mut help_command = Command::new(binary_path);
+            apply_windows_command_flags(&mut help_command);
+            help_command.arg("--help").output().or_else(|_| {
+                let mut fallback_command = Command::new(binary_path);
+                apply_windows_command_flags(&mut fallback_command);
+                fallback_command.output()
+            })?
+        };
         let combined = format!(
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),
@@ -3178,14 +3197,18 @@ impl Backend {
                     "app",
                     &format!("直接下载 CLIProxyAPI 失败，回退到 curl：{error}"),
                 );
-                let status = Command::new("curl")
-                    .arg("-L")
-                    .arg("--fail")
-                    .arg("-o")
-                    .arg(&archive_path)
-                    .arg(&descriptor.download_url)
-                    .status()
-                    .with_context(|| "failed to execute curl for CLIProxyAPI download")?;
+                let status = {
+                    let mut curl_command = Command::new("curl");
+                    apply_windows_command_flags(&mut curl_command);
+                    curl_command
+                        .arg("-L")
+                        .arg("--fail")
+                        .arg("-o")
+                        .arg(&archive_path)
+                        .arg(&descriptor.download_url)
+                        .status()
+                        .with_context(|| "failed to execute curl for CLIProxyAPI download")?
+                };
                 if !status.success() {
                     return Err(anyhow!(
                         "CLIProxyAPI 下载失败，curl 退出码 {:?}",
