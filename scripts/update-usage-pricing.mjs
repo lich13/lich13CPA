@@ -22,7 +22,7 @@ const REFERENCE_LINKS = [
     label: 'Alibaba Cloud Model Studio Pricing',
     url: 'https://help.aliyun.com/zh/model-studio/product-overview/billing-of-model-studio',
   },
-] 
+]
 
 const FALLBACK_RULES = [
   {
