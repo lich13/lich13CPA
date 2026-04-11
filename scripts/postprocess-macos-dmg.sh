@@ -8,23 +8,10 @@ fi
 
 DMG_DIR="$1"
 APP_NAME="$2"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HELPER_APPLESCRIPT="${SCRIPT_DIR}/fix-and-open-helper.applescript"
-HELPER_SHELL_SCRIPT="${SCRIPT_DIR}/fix-and-open-helper.sh"
-HELPER_APP_NAME="Fix_And_Open_${APP_NAME}.app"
+SETTINGS_SHORTCUT_NAME="Open_Privacy_Security_Settings.inetloc"
 
 if [[ ! -d "${DMG_DIR}" ]]; then
   echo "DMG directory not found: ${DMG_DIR}" >&2
-  exit 1
-fi
-
-if [[ ! -f "${HELPER_APPLESCRIPT}" ]]; then
-  echo "Helper AppleScript not found: ${HELPER_APPLESCRIPT}" >&2
-  exit 1
-fi
-
-if [[ ! -f "${HELPER_SHELL_SCRIPT}" ]]; then
-  echo "Helper shell script not found: ${HELPER_SHELL_SCRIPT}" >&2
   exit 1
 fi
 
@@ -38,7 +25,6 @@ TMP_DIR="$(mktemp -d)"
 RW_DMG="${TMP_DIR}/${APP_NAME}-rw.dmg"
 MOUNT_DIR="${TMP_DIR}/mount"
 FINAL_DMG="${TMP_DIR}/$(basename "${DMG_PATH}")"
-HELPER_BUILD_DIR="${TMP_DIR}/${HELPER_APP_NAME}"
 
 cleanup() {
   if mount | grep -q "on ${MOUNT_DIR} "; then
@@ -50,29 +36,30 @@ trap cleanup EXIT
 
 mkdir -p "${MOUNT_DIR}"
 
-chmod +x "${HELPER_SHELL_SCRIPT}"
-osacompile -o "${HELPER_BUILD_DIR}" "${HELPER_APPLESCRIPT}"
-cp "${HELPER_SHELL_SCRIPT}" "${HELPER_BUILD_DIR}/Contents/Resources/fix_and_open.sh"
-chmod +x "${HELPER_BUILD_DIR}/Contents/Resources/fix_and_open.sh"
-codesign --force --deep --sign - "${HELPER_BUILD_DIR}" >/dev/null
-
 hdiutil convert "${DMG_PATH}" -format UDRW -o "${RW_DMG}" -quiet
 hdiutil attach "${RW_DMG}" -mountpoint "${MOUNT_DIR}" -nobrowse -quiet
 
-cp -R "${HELPER_BUILD_DIR}" "${MOUNT_DIR}/${HELPER_APP_NAME}"
+cat > "${MOUNT_DIR}/${SETTINGS_SHORTCUT_NAME}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>URL</key>
+  <string>x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension</string>
+</dict>
+</plist>
+EOF
 
 cat > "${MOUNT_DIR}/README-If-macOS-blocks-launch.txt" <<EOF
-If macOS blocks ${APP_NAME}, open:
-${HELPER_APP_NAME}
+If macOS blocks ${APP_NAME}, do this:
+1. Drag ${APP_NAME}.app into /Applications first.
+2. Double-click ${SETTINGS_SHORTCUT_NAME} to jump to System Settings -> Privacy & Security.
+3. In Privacy & Security, click "Open Anyway" for ${APP_NAME}.
+4. Go back to /Applications, right-click ${APP_NAME}.app, choose Open once, then confirm.
 
-What the helper app does:
-1. install or update ${APP_NAME}.app
-2. remove the quarantine attribute
-3. open the app
-
-Important:
-- On unsigned builds, macOS may also block the helper app once.
-- If that happens, go to System Settings -> Privacy & Security and click "Open Anyway" for ${HELPER_APP_NAME}.
+Why this flow:
+- Unsigned helper apps or shell scripts inside a downloaded DMG are also blocked by Gatekeeper.
+- The included .inetloc shortcut is not blocked and can open the correct system settings page directly.
 EOF
 
 hdiutil detach "${MOUNT_DIR}" -quiet
