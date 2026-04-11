@@ -5,8 +5,10 @@ use anyhow::Result;
 use tauri::{
     menu::{Menu, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    ActivationPolicy, Listener, Manager, WindowEvent,
+    Listener, Manager, WindowEvent,
 };
+#[cfg(target_os = "macos")]
+use tauri::ActivationPolicy;
 use tauri_plugin_autostart::Builder as AutostartBuilder;
 #[cfg(target_os = "macos")]
 use tauri_plugin_autostart::MacosLauncher;
