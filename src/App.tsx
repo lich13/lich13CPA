@@ -44,11 +44,13 @@ import type {
   UsageModelSummary,
   UsagePricingConfig,
   UsagePricingRule,
+  UsagePricingSourceLink,
   UsageSummary,
   UsageSummaryQuery,
   UsageSummaryQueryPreset,
 } from '../shared/types'
 import './App.css'
+import { USAGE_PRICING_DEFAULTS, USAGE_PRICING_REFERENCE_LINKS } from './generated/usagePricingDefaults'
 
 const APP_ICON_SRC = 'app-icon.png'
 
@@ -183,16 +185,7 @@ const DEFAULT_NON_STREAM_KEEPALIVE_INTERVAL_SECONDS = 15
 const DEFAULT_USAGE_PRESET: UsageSummaryQueryPreset = '7d'
 const USAGE_PRICING_STORAGE_KEY = 'lich13cpa:usage-pricing'
 const DEFAULT_USAGE_CURRENCY = '¤'
-const PRICING_REFERENCE_LINKS = [
-  { label: 'OpenAI API Pricing', url: 'https://openai.com/api/pricing/' },
-  { label: 'Anthropic API Pricing', url: 'https://www.anthropic.com/pricing#api' },
-  { label: 'Gemini API Pricing', url: 'https://ai.google.dev/gemini-api/docs/pricing' },
-  { label: 'Moonshot Kimi Pricing', url: 'https://platform.moonshot.cn/docs/pricing/chat' },
-  {
-    label: 'Alibaba Cloud Model Studio Pricing',
-    url: 'https://help.aliyun.com/zh/model-studio/product-overview/billing-of-model-studio',
-  },
-] as const
+const PRICING_REFERENCE_LINKS: UsagePricingSourceLink[] = USAGE_PRICING_REFERENCE_LINKS
 
 const EMPTY_SETTINGS: SaveKnownSettingsInput = {
   port: DEFAULT_PORT,
@@ -215,82 +208,8 @@ const EMPTY_SETTINGS: SaveKnownSettingsInput = {
   autoStartProxyOnLaunch: true,
   minimizeToTrayOnClose: true,
 }
-
-const DEFAULT_USAGE_PRICING_CONFIG: UsagePricingConfig = {
-  currency: DEFAULT_USAGE_CURRENCY,
-  rules: [
-    {
-      id: 'gpt-5.4',
-      enabled: true,
-      name: 'GPT-5.4',
-      modelPattern: 'gpt-5.4*',
-      reasoningEffortPattern: '*',
-      inputPricePerMillion: 2.5,
-      outputPricePerMillion: 15,
-      cacheReadPricePerMillion: 0.25,
-      cacheWritePricePerMillion: 0,
-      multiplier: 1,
-      sourceUrl: 'https://openai.com/api/pricing/',
-      notes: '默认按 OpenAI 官方 API 价格，可手动调整。',
-    },
-    {
-      id: 'gpt-5.2',
-      enabled: true,
-      name: 'GPT-5.2 / GPT-5.2 Codex',
-      modelPattern: 'gpt-5.2*,gpt-5.2-codex*',
-      reasoningEffortPattern: '*',
-      inputPricePerMillion: 1.75,
-      outputPricePerMillion: 14,
-      cacheReadPricePerMillion: 0.175,
-      cacheWritePricePerMillion: 0,
-      multiplier: 1,
-      sourceUrl: 'https://platform.openai.com/docs/pricing',
-      notes: '默认按 OpenAI Platform Pricing 文档，可手动调整。',
-    },
-    {
-      id: 'gpt-5',
-      enabled: true,
-      name: 'GPT-5 / GPT-5.1 / Codex',
-      modelPattern: 'gpt-5*,gpt-5.1*,codex*',
-      reasoningEffortPattern: '*',
-      inputPricePerMillion: 1.25,
-      outputPricePerMillion: 10,
-      cacheReadPricePerMillion: 0.125,
-      cacheWritePricePerMillion: 0,
-      multiplier: 1,
-      sourceUrl: 'https://platform.openai.com/docs/pricing',
-      notes: '默认按 OpenAI Platform Pricing 文档，可手动调整。',
-    },
-    {
-      id: 'gpt-4.1',
-      enabled: true,
-      name: 'GPT-4.1',
-      modelPattern: 'gpt-4.1*',
-      reasoningEffortPattern: '*',
-      inputPricePerMillion: 2,
-      outputPricePerMillion: 8,
-      cacheReadPricePerMillion: 0.5,
-      cacheWritePricePerMillion: 0,
-      multiplier: 1,
-      sourceUrl: 'https://openai.com/api/pricing/',
-      notes: '默认按 OpenAI 官方 API 价格，可手动调整。',
-    },
-    {
-      id: 'gpt-4o',
-      enabled: true,
-      name: 'GPT-4o',
-      modelPattern: 'gpt-4o*',
-      reasoningEffortPattern: '*',
-      inputPricePerMillion: 2.5,
-      outputPricePerMillion: 10,
-      cacheReadPricePerMillion: 1.25,
-      cacheWritePricePerMillion: 0,
-      multiplier: 1,
-      sourceUrl: 'https://openai.com/api/pricing/',
-      notes: '默认按 OpenAI 官方 API 价格，可手动调整。',
-    },
-  ],
-}
+const DEFAULT_USAGE_PRICING_RULE_MAP = new Map(USAGE_PRICING_DEFAULTS.rules.map((rule) => [rule.id, rule]))
+const DEFAULT_USAGE_PRICING_RULE_ID_SET = new Set(DEFAULT_USAGE_PRICING_RULE_MAP.keys())
 
 const PAGES: PageMeta[] = [
   { id: 'dashboard', label: '仪表盘', icon: LayoutDashboard },
@@ -542,50 +461,149 @@ function createPricingRule(nextId: number): UsagePricingRule {
   }
 }
 
+function cloneUsagePricingRule(rule: UsagePricingRule): UsagePricingRule {
+  return { ...rule }
+}
+
+function getDefaultUsagePricingConfig(): UsagePricingConfig {
+  return {
+    currency: USAGE_PRICING_DEFAULTS.currency || DEFAULT_USAGE_CURRENCY,
+    defaultsUpdatedAt: USAGE_PRICING_DEFAULTS.defaultsUpdatedAt ?? null,
+    removedRuleIds: [],
+    rules: USAGE_PRICING_DEFAULTS.rules.map(cloneUsagePricingRule),
+    syncWarnings: [...(USAGE_PRICING_DEFAULTS.syncWarnings ?? [])],
+  }
+}
+
+function claimUsagePricingRuleId(candidate: string, seenRuleIds: Set<string>, fallbackId: string): string {
+  const normalizedCandidate = candidate.trim() || fallbackId
+
+  if (!seenRuleIds.has(normalizedCandidate)) {
+    seenRuleIds.add(normalizedCandidate)
+    return normalizedCandidate
+  }
+
+  let suffix = 2
+
+  while (seenRuleIds.has(`${normalizedCandidate}-${suffix}`)) {
+    suffix += 1
+  }
+
+  const nextId = `${normalizedCandidate}-${suffix}`
+  seenRuleIds.add(nextId)
+  return nextId
+}
+
+function getNextCustomPricingRuleNumber(rules: UsagePricingRule[]): number {
+  return (
+    rules.reduce((maxValue, rule) => {
+      const matched = rule.id.match(/^custom-(\d+)$/)
+      const value = matched ? Number(matched[1]) : 0
+      return Number.isFinite(value) ? Math.max(maxValue, value) : maxValue
+    }, 0) + 1
+  )
+}
+
+function normalizeUsagePricingRule(
+  rawRule: Partial<UsagePricingRule>,
+  fallbackRule: UsagePricingRule,
+  ruleId: string,
+): UsagePricingRule {
+  return {
+    ...fallbackRule,
+    ...rawRule,
+    id: ruleId,
+    name: typeof rawRule.name === 'string' ? rawRule.name : fallbackRule.name,
+    modelPattern: typeof rawRule.modelPattern === 'string' ? rawRule.modelPattern : fallbackRule.modelPattern,
+    reasoningEffortPattern:
+      typeof rawRule.reasoningEffortPattern === 'string' && rawRule.reasoningEffortPattern.trim()
+        ? rawRule.reasoningEffortPattern
+        : fallbackRule.reasoningEffortPattern,
+    sourceUrl: typeof rawRule.sourceUrl === 'string' ? rawRule.sourceUrl : fallbackRule.sourceUrl,
+    notes: typeof rawRule.notes === 'string' ? rawRule.notes : fallbackRule.notes,
+    enabled: rawRule.enabled !== false,
+    inputPricePerMillion: normalizePricingNumber(Number(rawRule.inputPricePerMillion ?? fallbackRule.inputPricePerMillion)),
+    outputPricePerMillion: normalizePricingNumber(Number(rawRule.outputPricePerMillion ?? fallbackRule.outputPricePerMillion)),
+    cacheReadPricePerMillion: normalizePricingNumber(
+      Number(rawRule.cacheReadPricePerMillion ?? fallbackRule.cacheReadPricePerMillion),
+    ),
+    cacheWritePricePerMillion: normalizePricingNumber(
+      Number(rawRule.cacheWritePricePerMillion ?? fallbackRule.cacheWritePricePerMillion),
+    ),
+    multiplier: normalizePricingNumber(Number(rawRule.multiplier ?? fallbackRule.multiplier)) || 1,
+  }
+}
+
 function loadUsagePricingConfig(): UsagePricingConfig {
+  const defaults = getDefaultUsagePricingConfig()
+
   if (typeof window === 'undefined' || !window.localStorage) {
-    return DEFAULT_USAGE_PRICING_CONFIG
+    return defaults
   }
 
   try {
     const raw = window.localStorage.getItem(USAGE_PRICING_STORAGE_KEY)
 
     if (!raw) {
-      return DEFAULT_USAGE_PRICING_CONFIG
+      return defaults
     }
 
     const parsed = JSON.parse(raw) as Partial<UsagePricingConfig>
-    const rules = Array.isArray(parsed.rules)
-      ? parsed.rules.map((rule, index) => ({
-          ...createPricingRule(index + 1),
-          ...rule,
-          id: typeof rule.id === 'string' && rule.id.trim() ? rule.id : `rule-${index + 1}`,
-          name: typeof rule.name === 'string' ? rule.name : `规则 ${index + 1}`,
-          modelPattern: typeof rule.modelPattern === 'string' ? rule.modelPattern : '',
-          reasoningEffortPattern:
-            typeof rule.reasoningEffortPattern === 'string' && rule.reasoningEffortPattern.trim()
-              ? rule.reasoningEffortPattern
-              : '*',
-          sourceUrl: typeof rule.sourceUrl === 'string' ? rule.sourceUrl : '',
-          notes: typeof rule.notes === 'string' ? rule.notes : '',
-          enabled: rule.enabled !== false,
-          inputPricePerMillion: normalizePricingNumber(Number(rule.inputPricePerMillion ?? 0)),
-          outputPricePerMillion: normalizePricingNumber(Number(rule.outputPricePerMillion ?? 0)),
-          cacheReadPricePerMillion: normalizePricingNumber(Number(rule.cacheReadPricePerMillion ?? 0)),
-          cacheWritePricePerMillion: normalizePricingNumber(Number(rule.cacheWritePricePerMillion ?? 0)),
-          multiplier: normalizePricingNumber(Number(rule.multiplier ?? 1)) || 1,
-        }))
-      : DEFAULT_USAGE_PRICING_CONFIG.rules
+    const removedRuleIds = Array.isArray(parsed.removedRuleIds)
+      ? parsed.removedRuleIds.filter(
+          (item): item is string => typeof item === 'string' && DEFAULT_USAGE_PRICING_RULE_ID_SET.has(item),
+        )
+      : []
+    const defaultRuleOverrides = new Map<string, UsagePricingRule>()
+    const customRules: UsagePricingRule[] = []
+    const seenRuleIds = new Set(defaults.rules.map((rule) => rule.id))
+    let nextCustomRuleNumber = getNextCustomPricingRuleNumber(defaults.rules)
+
+    if (Array.isArray(parsed.rules)) {
+      for (const candidate of parsed.rules) {
+        if (!candidate || typeof candidate !== 'object') {
+          continue
+        }
+
+        const rawRule = candidate as Partial<UsagePricingRule>
+        const rawRuleId = typeof rawRule.id === 'string' ? rawRule.id.trim() : ''
+
+        if (rawRuleId && DEFAULT_USAGE_PRICING_RULE_ID_SET.has(rawRuleId)) {
+          const fallbackRule = DEFAULT_USAGE_PRICING_RULE_MAP.get(rawRuleId)
+
+          if (fallbackRule) {
+            defaultRuleOverrides.set(rawRuleId, normalizeUsagePricingRule(rawRule, fallbackRule, rawRuleId))
+          }
+
+          continue
+        }
+
+        const fallbackRule = createPricingRule(nextCustomRuleNumber)
+        const ruleId = claimUsagePricingRuleId(rawRuleId || fallbackRule.id, seenRuleIds, fallbackRule.id)
+        customRules.push(normalizeUsagePricingRule(rawRule, fallbackRule, ruleId))
+        nextCustomRuleNumber += 1
+      }
+    }
+
+    const rules = [
+      ...defaults.rules
+        .filter((rule) => !removedRuleIds.includes(rule.id))
+        .map((rule) => cloneUsagePricingRule(defaultRuleOverrides.get(rule.id) ?? rule)),
+      ...customRules,
+    ]
 
     return {
       currency:
         typeof parsed.currency === 'string' && parsed.currency.trim()
           ? parsed.currency
-          : DEFAULT_USAGE_CURRENCY,
+          : defaults.currency,
+      defaultsUpdatedAt: defaults.defaultsUpdatedAt ?? null,
+      removedRuleIds,
       rules,
+      syncWarnings: [...(defaults.syncWarnings ?? [])],
     }
   } catch {
-    return DEFAULT_USAGE_PRICING_CONFIG
+    return defaults
   }
 }
 
@@ -670,7 +688,12 @@ function computeUsagePricing(
     }
 
     const multiplier = normalizePricingNumber(rule.multiplier) || 1
-    const nextInputCost = (item.inputTokens / 1_000_000) * normalizePricingNumber(rule.inputPricePerMillion) * multiplier
+    const billableInputTokens = Math.max(
+      0,
+      Number.isFinite(item.billableInputTokens) ? item.billableInputTokens : item.inputTokens - item.cachedTokens,
+    )
+    const nextInputCost =
+      (billableInputTokens / 1_000_000) * normalizePricingNumber(rule.inputPricePerMillion) * multiplier
     const nextOutputCost = (item.outputTokens / 1_000_000) * normalizePricingNumber(rule.outputPricePerMillion) * multiplier
     const nextCacheReadCost = (item.cachedTokens / 1_000_000) * normalizePricingNumber(rule.cacheReadPricePerMillion) * multiplier
     const nextCacheWriteCost = (item.cacheCreationTokens / 1_000_000) * normalizePricingNumber(rule.cacheWritePricePerMillion) * multiplier
@@ -1386,7 +1409,7 @@ async function loadState() {
 
   function addUsagePricingRule() {
     setUsagePricingConfig((current) => {
-      const nextId = current.rules.length + 1
+      const nextId = getNextCustomPricingRuleNumber(current.rules)
       return {
         ...current,
         rules: [...current.rules, createPricingRule(nextId)],
@@ -1395,14 +1418,21 @@ async function loadState() {
   }
 
   function deleteUsagePricingRule(ruleId: string) {
-    setUsagePricingConfig((current) => ({
-      ...current,
-      rules: current.rules.filter((rule) => rule.id !== ruleId),
-    }))
+    setUsagePricingConfig((current) => {
+      const nextRemovedRuleIds = DEFAULT_USAGE_PRICING_RULE_ID_SET.has(ruleId)
+        ? Array.from(new Set([...(current.removedRuleIds ?? []), ruleId]))
+        : [...(current.removedRuleIds ?? [])]
+
+      return {
+        ...current,
+        removedRuleIds: nextRemovedRuleIds,
+        rules: current.rules.filter((rule) => rule.id !== ruleId),
+      }
+    })
   }
 
   function resetUsagePricingRules() {
-    setUsagePricingConfig(DEFAULT_USAGE_PRICING_CONFIG)
+    setUsagePricingConfig(getDefaultUsagePricingConfig())
     pushNotice('success', '已恢复默认计价规则')
   }
 
@@ -3159,7 +3189,10 @@ async function loadState() {
         <div className="section-head">
           <div>
             <h2>计价规则</h2>
-            <p>按模型模式匹配价格。默认值参考官方价格页，你可以手动覆盖。</p>
+            <p>
+              按模型模式匹配价格。默认规则会在每次编译时同步官方价格页；当前构建同步时间{' '}
+              {formatTime(usagePricingConfig.defaultsUpdatedAt)}。你可以手动覆盖。
+            </p>
           </div>
           <div className="action-row">
             <button className="ghost-button" onClick={resetUsagePricingRules} type="button">
@@ -3197,6 +3230,13 @@ async function loadState() {
           <div className="warning-banner">
             <strong>有模型尚未匹配计价规则</strong>
             <span>{usagePricing.unmatchedModels.join('、')}</span>
+          </div>
+        ) : null}
+
+        {(usagePricingConfig.syncWarnings?.length ?? 0) > 0 ? (
+          <div className="warning-banner">
+            <strong>部分官方价格同步失败</strong>
+            <span>{usagePricingConfig.syncWarnings?.join('；')}</span>
           </div>
         ) : null}
 

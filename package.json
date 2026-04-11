@@ -11,6 +11,7 @@
   "scripts": {
     "dev": "npm run tauri:dev",
     "dev:renderer": "vite",
+    "usage:pricing:update": "node scripts/update-usage-pricing.mjs",
     "tauri:prepare:host": "node scripts/prepare-tauri-bundled-binary.mjs",
     "tauri:prepare:mac:arm64": "node scripts/prepare-tauri-bundled-binary.mjs --target aarch64-apple-darwin",
     "tauri:prepare:win:x64": "node scripts/prepare-tauri-bundled-binary.mjs --target x86_64-pc-windows-msvc",
@@ -23,8 +24,8 @@
     "tauri:build:debug:mac:arm64": "npm run tauri:prepare:mac:arm64 && tauri build --debug --target aarch64-apple-darwin",
     "tauri:build:win:x64": "npm run tauri:prepare:win:x64 && tauri build --target x86_64-pc-windows-msvc",
     "tauri:build:win:arm64": "npm run tauri:prepare:win:arm64 && tauri build --target aarch64-pc-windows-msvc",
-    "build": "tsc -b && npm run build:renderer",
-    "build:renderer": "vite build",
+    "build": "npm run usage:pricing:update && tsc -b && vite build",
+    "build:renderer": "npm run usage:pricing:update && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
     "start": "npm run tauri:dev"

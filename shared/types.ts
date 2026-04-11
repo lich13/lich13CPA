@@ -385,9 +385,17 @@ export interface UsagePricingRule {
   notes: string
 }
 
+export interface UsagePricingSourceLink {
+  label: string
+  url: string
+}
+
 export interface UsagePricingConfig {
   currency: string
+  defaultsUpdatedAt?: string | null
+  removedRuleIds?: string[]
   rules: UsagePricingRule[]
+  syncWarnings?: string[]
 }
 
 export interface ProxyStatus {
