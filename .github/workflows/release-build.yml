@@ -1,0 +1,140 @@
+name: Build Release Bundles
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Optional version to publish as a tag/release (for example 0.1.0 or v0.1.0). Leave empty to only build artifacts.
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+run-name: >-
+  ${{
+    github.event_name == 'workflow_dispatch' && inputs.version != ''
+      && format('Build and release {0}', inputs.version)
+      || github.event_name == 'workflow_dispatch'
+      && 'Build artifacts (manual)'
+      || format('Build release bundles for {0}', github.ref_name)
+  }}
+
+jobs:
+  build-tauri:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS arm64
+            os: macos-14
+            rust_target: aarch64-apple-darwin
+            prepare_cmd: node scripts/prepare-tauri-bundled-binary.mjs --target aarch64-apple-darwin
+            build_cmd: npx tauri build --bundles dmg --target aarch64-apple-darwin
+            postprocess_cmd: bash scripts/postprocess-macos-dmg.sh src-tauri/target/aarch64-apple-darwin/release/bundle/dmg lich13CPA
+            artifact_name: macos-dmg-arm64
+            artifact_path: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          - label: Windows x64
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            prepare_cmd: node scripts/prepare-tauri-bundled-binary.mjs --target x86_64-pc-windows-msvc
+            build_cmd: npx tauri build --bundles nsis --target x86_64-pc-windows-msvc
+            postprocess_cmd: ''
+            artifact_name: windows-exe-x64
+            artifact_path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          - label: Windows arm64
+            os: windows-latest
+            rust_target: aarch64-pc-windows-msvc
+            prepare_cmd: node scripts/prepare-tauri-bundled-binary.mjs --target aarch64-pc-windows-msvc
+            build_cmd: npx tauri build --bundles nsis --target aarch64-pc-windows-msvc
+            postprocess_cmd: ''
+            artifact_name: windows-exe-arm64
+            artifact_path: src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Prepare bundled binary
+        run: ${{ matrix.prepare_cmd }}
+
+      - name: Build Tauri bundle
+        run: ${{ matrix.build_cmd }}
+
+      - name: Postprocess macOS DMG
+        if: ${{ matrix.postprocess_cmd != '' }}
+        run: ${{ matrix.postprocess_cmd }}
+
+      - name: Upload bundle artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
+          compression-level: 0
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-tauri]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.version != '')
+
+    steps:
+      - name: Download bundle artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Normalize release tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG_NAME="${GITHUB_REF_NAME}"
+          else
+            RAW_VERSION="${{ inputs.version }}"
+            RAW_VERSION="${RAW_VERSION//[[:space:]]/}"
+            if [[ -z "${RAW_VERSION}" ]]; then
+              echo "Manual release requires a version input." >&2
+              exit 1
+            fi
+            if [[ "${RAW_VERSION}" == v* ]]; then
+              TAG_NAME="${RAW_VERSION}"
+            else
+              TAG_NAME="v${RAW_VERSION}"
+            fi
+          fi
+          echo "tag_name=${TAG_NAME}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag_name }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            release-assets/*.exe
+            release-assets/*.dmg
+          generate_release_notes: true
