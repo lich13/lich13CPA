@@ -80,7 +80,35 @@ jobs:
       - name: Prepare bundled binary
         run: ${{ matrix.prepare_cmd }}
 
+      - name: Build Tauri bundle (macOS)
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          max_attempts=2
+          attempt=1
+
+          while true; do
+            echo "macOS bundle attempt ${attempt}/${max_attempts}"
+
+            if eval "${{ matrix.build_cmd }}"; then
+              break
+            fi
+
+            if [[ "${attempt}" -ge "${max_attempts}" ]]; then
+              echo "macOS bundle failed after ${attempt} attempts" >&2
+              exit 1
+            fi
+
+            echo "Cleaning bundle output before retry..."
+            rm -rf "src-tauri/target/${{ matrix.rust_target }}/release/bundle"
+            attempt=$((attempt + 1))
+            sleep 20
+          done
+
       - name: Build Tauri bundle
+        if: ${{ !startsWith(matrix.os, 'macos') }}
         run: ${{ matrix.build_cmd }}
 
       - name: Postprocess macOS DMG
