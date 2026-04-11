@@ -649,6 +649,21 @@ function matchUsagePricingRule(model: string, rules: UsagePricingRule[]): UsageP
   return null
 }
 
+function ruleMatchesModel(rule: UsagePricingRule, model: string): boolean {
+  if (!rule.enabled) {
+    return false
+  }
+
+  const normalizedModel = model.trim().toLowerCase()
+  const patterns = splitPatterns(rule.modelPattern)
+
+  if (patterns.length === 0) {
+    return false
+  }
+
+  return patterns.some((pattern) => wildcardMatch(pattern, normalizedModel))
+}
+
 function computeUsagePricing(
   summary: UsageSummary | null,
   pricingConfig: UsagePricingConfig,
@@ -724,6 +739,101 @@ function computeUsagePricing(
     pricedModels: pricedModels.sort((left, right) => right.estimatedCost - left.estimatedCost),
     unmatchedModels,
   }
+}
+
+function collectPreferredPricingModels(state: DesktopAppState | null): string[] {
+  if (!state) {
+    return []
+  }
+
+  const names = new Set<string>()
+  const appendModel = (value: string | null | undefined) => {
+    const normalized = value?.trim().toLowerCase()
+
+    if (normalized) {
+      names.add(normalized)
+    }
+  }
+  const appendMappings = (models: ProviderModelMapping[]) => {
+    for (const model of models) {
+      appendModel(model.name)
+      appendModel(model.alias)
+    }
+  }
+
+  for (const provider of state.providers) {
+    appendMappings(provider.models)
+  }
+
+  for (const provider of state.aiProviders.gemini) {
+    appendMappings(provider.models)
+  }
+
+  for (const provider of state.aiProviders.codex) {
+    appendMappings(provider.models)
+  }
+
+  for (const provider of state.aiProviders.claude) {
+    appendMappings(provider.models)
+  }
+
+  for (const provider of state.aiProviders.vertex) {
+    appendMappings(provider.models)
+  }
+
+  for (const provider of state.aiProviders.openaiCompatibility) {
+    appendMappings(provider.models)
+  }
+
+  return [...names]
+}
+
+function getOrderedUsagePricingRules(
+  rules: UsagePricingRule[],
+  summary: UsageSummary | null,
+  preferredModels: string[],
+): UsagePricingRule[] {
+  const usageModels = summary?.topModels ?? []
+
+  return rules
+    .map((rule, index) => {
+      const matchedUsageModels = usageModels.filter((item) => ruleMatchesModel(rule, item.model))
+      const matchedPreferredModels = preferredModels.filter((model) => ruleMatchesModel(rule, model))
+
+      return {
+        index,
+        rule,
+        matchedPreferredCount: matchedPreferredModels.length,
+        matchedUsageRequests: matchedUsageModels.reduce((sum, item) => sum + item.requests, 0),
+        matchedUsageTokens: matchedUsageModels.reduce((sum, item) => sum + item.totalTokens, 0),
+        hasPreferredMatch: matchedPreferredModels.length > 0,
+        hasUsageMatch: matchedUsageModels.some((item) => item.requests > 0 || item.totalTokens > 0),
+      }
+    })
+    .sort((left, right) => {
+      if (left.hasUsageMatch !== right.hasUsageMatch) {
+        return left.hasUsageMatch ? -1 : 1
+      }
+
+      if (left.matchedUsageRequests !== right.matchedUsageRequests) {
+        return right.matchedUsageRequests - left.matchedUsageRequests
+      }
+
+      if (left.matchedUsageTokens !== right.matchedUsageTokens) {
+        return right.matchedUsageTokens - left.matchedUsageTokens
+      }
+
+      if (left.hasPreferredMatch !== right.hasPreferredMatch) {
+        return left.hasPreferredMatch ? -1 : 1
+      }
+
+      if (left.matchedPreferredCount !== right.matchedPreferredCount) {
+        return right.matchedPreferredCount - left.matchedPreferredCount
+      }
+
+      return left.index - right.index
+    })
+    .map((entry) => entry.rule)
 }
 
 function formatCompactCount(value: number): string {
@@ -1342,6 +1452,12 @@ function App() {
   const quotaRequestedRef = useRef(new Set<string>())
   const authPollTimerRef = useRef<Record<string, number>>({})
   const deferredLogs = useDeferredValue(appState?.logs ?? [])
+  const preferredPricingModels = collectPreferredPricingModels(appState)
+  const sortedUsagePricingRules = getOrderedUsagePricingRules(
+    usagePricingConfig.rules,
+    usageSummary ?? appState?.usageSummary ?? null,
+    preferredPricingModels,
+  )
   const usagePricing = computeUsagePricing(usageSummary, usagePricingConfig)
   const refreshUsageSummary = useEffectEvent((query: UsageSummaryQuery) => {
     void fetchUsageSummaryForRange(query)
@@ -3193,6 +3309,7 @@ async function loadState() {
               按模型模式匹配价格。默认规则会在每次编译时同步官方价格页；当前构建同步时间{' '}
               {formatTime(usagePricingConfig.defaultsUpdatedAt)}。你可以手动覆盖。
             </p>
+            <p>显示顺序：最近使用最多的模型优先，其次是当前已配置可用的模型。</p>
           </div>
           <div className="action-row">
             <button className="ghost-button" onClick={resetUsagePricingRules} type="button">
@@ -3241,7 +3358,7 @@ async function loadState() {
         ) : null}
 
         <div className="usage-pricing-rule-list">
-          {usagePricingConfig.rules.map((rule) => (
+          {sortedUsagePricingRules.map((rule) => (
             <article className="usage-pricing-rule-card" key={rule.id}>
               <div className="usage-pricing-rule-head">
                 <strong>{rule.name || '未命名规则'}</strong>
