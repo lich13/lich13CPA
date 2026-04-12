@@ -105,7 +105,7 @@ fn build_tray_menu<R: tauri::Runtime>(
     let stop = MenuItemBuilder::with_id(TRAY_STOP_PROXY_ID, "停止代理")
         .enabled(backend.proxy_running())
         .build(app)?;
-    let quit = MenuItemBuilder::with_id(TRAY_QUIT_ID, "退出").build(app)?;
+    let quit = MenuItemBuilder::with_id(TRAY_QUIT_ID, "停止代理并退出").build(app)?;
 
     menu.append(&show)?;
     menu.append(&start)?;
@@ -167,8 +167,12 @@ fn build_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>, backend: Backend) ->
                 });
             }
             TRAY_QUIT_ID => {
-                menu_backend.mark_quit_requested(true);
-                app.exit(0);
+                let backend = menu_backend.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = backend.stop_proxy_and_quit().await {
+                        eprintln!("failed to stop proxy and quit from tray: {error}");
+                    }
+                });
             }
             _ => {}
         })
