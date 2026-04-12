@@ -45,16 +45,32 @@ async function updateJsonVersion(filePath, nextVersion, updater = null) {
 
 async function updateCargoTomlVersion(filePath, nextVersion) {
   const raw = await fs.readFile(filePath, 'utf8')
-  const updated = raw.replace(
-    /(\[package\][\s\S]*?^version\s*=\s*")([^"]+)(")/m,
-    `$1${nextVersion}$3`,
-  )
+  const newline = raw.includes('\r\n') ? '\r\n' : '\n'
+  const lines = raw.split(/\r?\n/)
+  let inPackageSection = false
+  let replaced = false
 
-  if (updated === raw) {
+  const updatedLines = lines.map((line) => {
+    const trimmed = line.trim()
+
+    if (trimmed.startsWith('[')) {
+      inPackageSection = trimmed === '[package]'
+      return line
+    }
+
+    if (inPackageSection && /^\s*version\s*=/.test(line) && !replaced) {
+      replaced = true
+      return line.replace(/(\s*version\s*=\s*")([^"]+)(")/, `$1${nextVersion}$3`)
+    }
+
+    return line
+  })
+
+  if (!replaced) {
     throw new Error(`Failed to update Cargo.toml version in ${filePath}`)
   }
 
-  await fs.writeFile(filePath, updated)
+  await fs.writeFile(filePath, `${updatedLines.join(newline)}${newline}`)
 }
 
 async function main() {
