@@ -156,7 +156,7 @@ jobs:
 
     steps:
       - name: Download bundle artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
@@ -183,11 +183,34 @@ jobs:
           echo "tag_name=${TAG_NAME}" >> "${GITHUB_OUTPUT}"
 
       - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.tag_name }}
-          target_commitish: ${{ github.sha }}
-          files: |
-            release-assets/*.exe
-            release-assets/*.dmg
-          generate_release_notes: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t release_files < <(find release-assets -maxdepth 1 -type f \( -name '*.exe' -o -name '*.dmg' \) | sort)
+
+          if [[ "${#release_files[@]}" -eq 0 ]]; then
+            echo "No release assets found." >&2
+            exit 1
+          fi
+
+          TAG_NAME="${{ steps.tag.outputs.tag_name }}"
+
+          if gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            RELEASE_ID="$(gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" --json id -q '.id')"
+            gh api \
+              --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+              -f target_commitish="${GITHUB_SHA}" \
+              -F generate_release_notes=true >/dev/null
+            gh release upload "${TAG_NAME}" "${release_files[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create \
+              "${TAG_NAME}" \
+              "${release_files[@]}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --generate-notes
+          fi
