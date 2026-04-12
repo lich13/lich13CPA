@@ -73,6 +73,9 @@ const CLIPROXY_RELEASES_LATEST_URL: &str =
     "https://github.com/router-for-me/CLIProxyAPI/releases/latest";
 const CLIPROXY_RELEASES_LATEST_API_URL: &str =
     "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest";
+const DESKTOP_APP_RELEASES_LATEST_URL: &str = "https://github.com/lich13/lich13CPA/releases/latest";
+const DESKTOP_APP_RELEASES_LATEST_API_URL: &str =
+    "https://api.github.com/repos/lich13/lich13CPA/releases/latest";
 const DEFAULT_PROXY_CHECK_URL: &str = "https://example.com";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -262,6 +265,33 @@ impl Default for ProxyBinaryStateData {
 }
 
 #[derive(Debug, Clone)]
+struct AppUpdateStateData {
+    current_version: String,
+    latest_version: Option<String>,
+    latest_tag: Option<String>,
+    latest_asset_name: Option<String>,
+    update_available: Option<bool>,
+    last_checked_at: Option<String>,
+    last_downloaded_at: Option<String>,
+    last_error: Option<String>,
+}
+
+impl Default for AppUpdateStateData {
+    fn default() -> Self {
+        Self {
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            latest_version: None,
+            latest_tag: None,
+            latest_asset_name: None,
+            update_available: None,
+            last_checked_at: None,
+            last_downloaded_at: None,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct BinaryVersionCacheEntry {
     path: String,
     mtime_ms: u64,
@@ -342,6 +372,14 @@ struct ReleaseAssetDescriptor {
     version: String,
 }
 
+#[derive(Debug, Clone)]
+struct AppReleaseAssetDescriptor {
+    asset_name: String,
+    download_url: String,
+    tag: String,
+    version: String,
+}
+
 #[derive(Clone)]
 pub struct Backend {
     inner: Arc<BackendInner>,
@@ -356,6 +394,7 @@ struct BackendInner {
     usage_state_cache: Mutex<Option<PersistedUsageState>>,
     proxy_status: Mutex<ProxyStatusData>,
     proxy_binary: Mutex<ProxyBinaryStateData>,
+    app_update: Mutex<AppUpdateStateData>,
     proxy_child: Mutex<Option<Arc<Mutex<Child>>>>,
     watchers: Mutex<Vec<RecommendedWatcher>>,
     binary_version_cache: Mutex<Option<BinaryVersionCacheEntry>>,
@@ -381,6 +420,7 @@ impl Backend {
                 usage_state_cache: Mutex::new(None),
                 proxy_status: Mutex::new(ProxyStatusData::default()),
                 proxy_binary: Mutex::new(ProxyBinaryStateData::default()),
+                app_update: Mutex::new(AppUpdateStateData::default()),
                 proxy_child: Mutex::new(None),
                 watchers: Mutex::new(Vec::new()),
                 binary_version_cache: Mutex::new(None),
@@ -417,6 +457,13 @@ impl Backend {
                     binary.last_error = Some(error.to_string());
                 }
                 backend.append_log("warn", "app", &format!("CLIProxyAPI 更新检查失败：{error}"));
+            }
+            if let Err(error) = backend.refresh_app_update_state().await {
+                {
+                    let mut app_update = backend.inner.app_update.lock().unwrap();
+                    app_update.last_error = Some(error.to_string());
+                }
+                backend.append_log("warn", "app", &format!("桌面应用更新检查失败：{error}"));
             }
             backend.emit_state_changed();
         });
@@ -828,6 +875,18 @@ impl Backend {
 
     pub async fn update_proxy_binary(&self) -> Result<Value> {
         self.update_proxy_binary_internal().await?;
+        self.emit_state_changed();
+        self.build_app_state(None).await
+    }
+
+    pub async fn check_app_update(&self) -> Result<Value> {
+        self.refresh_app_update_state().await?;
+        self.emit_state_changed();
+        self.build_app_state(None).await
+    }
+
+    pub async fn update_app(&self) -> Result<Value> {
+        self.install_app_update().await?;
         self.emit_state_changed();
         self.build_app_state(None).await
     }
@@ -2400,6 +2459,7 @@ impl Backend {
 
         let status = self.inner.proxy_status.lock().unwrap().clone();
         let binary = self.inner.proxy_binary.lock().unwrap().clone();
+        let app_update = self.inner.app_update.lock().unwrap().clone();
         let provider_imports = self.build_provider_import_summaries(&auth_files);
 
         Ok(json!({
@@ -2435,6 +2495,16 @@ impl Backend {
             "lastCheckedAt": binary.last_checked_at,
             "lastUpdatedAt": binary.last_updated_at,
             "lastError": binary.last_error,
+          },
+          "appUpdate": {
+            "currentVersion": app_update.current_version,
+            "latestVersion": app_update.latest_version,
+            "latestTag": app_update.latest_tag,
+            "latestAssetName": app_update.latest_asset_name,
+            "updateAvailable": app_update.update_available,
+            "lastCheckedAt": app_update.last_checked_at,
+            "lastDownloadedAt": app_update.last_downloaded_at,
+            "lastError": app_update.last_error,
           },
           "knownSettings": known_settings,
           "configText": raw_config_text,
@@ -3139,6 +3209,115 @@ impl Backend {
             Some(descriptor.version),
         );
         Ok(())
+    }
+
+    fn current_app_version(&self) -> String {
+        self.inner.app.package_info().version.to_string()
+    }
+
+    async fn refresh_app_update_state(&self) -> Result<()> {
+        let current_version = self.current_app_version();
+        let descriptor = fetch_latest_app_release_descriptor(&self.inner.client).await?;
+        let mut app_update = self.inner.app_update.lock().unwrap();
+        app_update.current_version = current_version.clone();
+        app_update.latest_tag = Some(descriptor.tag.clone());
+        app_update.latest_version = Some(descriptor.version.clone());
+        app_update.latest_asset_name = Some(descriptor.asset_name.clone());
+        app_update.last_checked_at = Some(now_iso());
+        app_update.last_error = None;
+        app_update.update_available =
+            compare_versions(&descriptor.version, &current_version).map(|value| value > 0);
+        Ok(())
+    }
+
+    async fn install_app_update(&self) -> Result<PathBuf> {
+        let current_version = self.current_app_version();
+        let descriptor = fetch_latest_app_release_descriptor(&self.inner.client).await?;
+
+        if let Some(ordering) = compare_versions(&descriptor.version, &current_version) {
+            if ordering <= 0 {
+                return Err(anyhow!("当前已是最新版本，无需更新。"));
+            }
+        }
+
+        let updates_dir = self.inner.paths.base_dir.join("updates");
+        fs::create_dir_all(&updates_dir)?;
+        let installer_path = updates_dir.join(&descriptor.asset_name);
+
+        self.append_log(
+            "info",
+            "app",
+            &format!(
+                "开始下载桌面应用更新 {}：{}",
+                descriptor.version, descriptor.asset_name
+            ),
+        );
+
+        let payload_result = self
+            .inner
+            .client
+            .get(&descriptor.download_url)
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await;
+
+        match payload_result {
+            Ok(response) => {
+                let payload = response.error_for_status()?.bytes().await?;
+                fs::write(&installer_path, payload)?;
+            }
+            Err(error) => {
+                self.append_log(
+                    "warn",
+                    "app",
+                    &format!("直接下载桌面应用更新失败，回退到 curl：{error}"),
+                );
+                let status = {
+                    let mut curl_command = Command::new("curl");
+                    apply_windows_command_flags(&mut curl_command);
+                    curl_command
+                        .arg("-L")
+                        .arg("--fail")
+                        .arg("-o")
+                        .arg(&installer_path)
+                        .arg(&descriptor.download_url)
+                        .status()
+                        .with_context(|| "failed to execute curl for desktop app update download")?
+                };
+
+                if !status.success() {
+                    return Err(anyhow!(
+                        "桌面应用更新下载失败，curl 退出码 {:?}",
+                        status.code()
+                    ));
+                }
+            }
+        }
+
+        self.open_path(installer_path.to_string_lossy().to_string())?;
+
+        {
+            let mut app_update = self.inner.app_update.lock().unwrap();
+            app_update.current_version = current_version;
+            app_update.latest_tag = Some(descriptor.tag);
+            app_update.latest_version = Some(descriptor.version);
+            app_update.latest_asset_name = Some(descriptor.asset_name.clone());
+            app_update.last_checked_at = Some(now_iso());
+            app_update.last_downloaded_at = Some(now_iso());
+            app_update.last_error = None;
+            app_update.update_available = Some(true);
+        }
+
+        self.append_log(
+            "info",
+            "app",
+            &format!(
+                "已打开桌面应用更新安装包：{}",
+                installer_path.to_string_lossy()
+            ),
+        );
+
+        Ok(installer_path)
     }
 
     async fn update_proxy_binary_internal(&self) -> Result<String> {
@@ -5808,6 +5987,88 @@ async fn fetch_latest_release_descriptor(client: &Client) -> Result<ReleaseAsset
     let tag = regex_capture(&url, r"/releases/tag/([^/?#]+)")
         .ok_or_else(|| anyhow!("无法解析 CLIProxyAPI 最新发布版本。"))?;
     fetch_release_asset_descriptor(&tag)
+}
+
+fn desktop_app_asset_suffixes() -> Result<Vec<&'static str>> {
+    let arch = std::env::consts::ARCH;
+
+    if cfg!(target_os = "windows") {
+        match arch {
+            "x86_64" => Ok(vec!["_x64-setup.exe"]),
+            "aarch64" => Ok(vec!["_arm64-setup.exe"]),
+            other => Err(anyhow!("Windows 桌面应用更新暂不支持当前架构: {other}")),
+        }
+    } else if cfg!(target_os = "macos") {
+        match arch {
+            "aarch64" => Ok(vec!["_aarch64.dmg"]),
+            "x86_64" => Ok(vec!["_x64.dmg", "_x86_64.dmg", ".dmg"]),
+            other => Err(anyhow!("macOS 桌面应用更新暂不支持当前架构: {other}")),
+        }
+    } else {
+        Err(anyhow!("当前平台暂不支持桌面应用自动更新。"))
+    }
+}
+
+fn select_desktop_app_release_asset(payload: &Value) -> Result<AppReleaseAssetDescriptor> {
+    let tag = normalized_string(payload.get("tag_name"))
+        .or_else(|| normalized_string(payload.get("name")))
+        .or_else(|| normalized_string(payload.get("tag")))
+        .ok_or_else(|| anyhow!("缺少桌面应用发布版本号。"))?;
+    let version = tag.trim().trim_start_matches('v').to_string();
+    let assets = payload
+        .get("assets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("桌面应用发布缺少资产列表。"))?;
+    let suffixes = desktop_app_asset_suffixes()?;
+
+    for suffix in &suffixes {
+        if let Some(asset) = assets.iter().find(|asset| {
+            normalized_string(asset.get("name"))
+                .map(|name| name.ends_with(suffix))
+                .unwrap_or(false)
+        }) {
+            let asset_name = normalized_string(asset.get("name"))
+                .ok_or_else(|| anyhow!("桌面应用发布资产缺少名称。"))?;
+            let download_url = normalized_string(
+                asset
+                    .get("browser_download_url")
+                    .or_else(|| asset.get("browserDownloadUrl")),
+            )
+            .ok_or_else(|| anyhow!("桌面应用发布资产缺少下载地址。"))?;
+
+            return Ok(AppReleaseAssetDescriptor {
+                asset_name,
+                download_url,
+                tag,
+                version,
+            });
+        }
+    }
+
+    Err(anyhow!("未找到与当前平台匹配的桌面应用安装包。"))
+}
+
+async fn fetch_latest_app_release_descriptor(client: &Client) -> Result<AppReleaseAssetDescriptor> {
+    let response = client
+        .get(DESKTOP_APP_RELEASES_LATEST_API_URL)
+        .header("accept", "application/vnd.github+json")
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        let body_text = response.text().await?;
+        if let Ok(payload) = serde_json::from_str::<Value>(&body_text) {
+            return select_desktop_app_release_asset(&payload);
+        }
+    }
+
+    let response = client.get(DESKTOP_APP_RELEASES_LATEST_URL).send().await?;
+    let url = response.url().as_str().to_string();
+    let tag = regex_capture(&url, r"/releases/tag/([^/?#]+)")
+        .ok_or_else(|| anyhow!("无法解析桌面应用最新发布版本。"))?;
+    Err(anyhow!(
+        "无法从 GitHub Release API 解析桌面应用资产，请检查最新发布 {tag} 是否包含当前平台安装包。"
+    ))
 }
 
 fn extract_archive(archive_path: &Path, destination: &Path, archive_kind: &str) -> Result<()> {

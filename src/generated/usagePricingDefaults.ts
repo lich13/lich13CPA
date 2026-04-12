@@ -10,7 +10,7 @@ type GeneratedUsagePricingPayload = {
 
 const generatedUsagePricingPayload: GeneratedUsagePricingPayload = {
   "currency": "¤",
-  "generatedAt": "2026-04-11T16:08:30.915Z",
+  "generatedAt": "2026-04-12T00:41:37.349Z",
   "referenceLinks": [
     {
       "label": "OpenAI API Pricing",

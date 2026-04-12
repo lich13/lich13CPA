@@ -87,6 +87,16 @@ pub async fn update_proxy_binary(backend: State<'_, Backend>) -> Result<Value, S
 }
 
 #[tauri::command]
+pub async fn check_app_update(backend: State<'_, Backend>) -> Result<Value, String> {
+    backend.check_app_update().await.map_err(map_error)
+}
+
+#[tauri::command]
+pub async fn update_app(backend: State<'_, Backend>) -> Result<Value, String> {
+    backend.update_app().await.map_err(map_error)
+}
+
+#[tauri::command]
 pub async fn pick_auth_files(
     provider_hint: Option<String>,
     backend: State<'_, Backend>,

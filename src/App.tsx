@@ -2408,6 +2408,53 @@ async function loadState() {
               </button>
             </div>
           </article>
+
+          <article className="metric-card">
+            <span className="metric-label">软件更新</span>
+            <strong>v{state.appUpdate.currentVersion}</strong>
+            <span className="metric-help">
+              最新 {state.appUpdate.latestVersion ? `v${state.appUpdate.latestVersion}` : '未检查'} · 资产{' '}
+              {state.appUpdate.latestAssetName ?? '未解析'}
+            </span>
+            <div className="action-row">
+              <button
+                className="ghost-button"
+                onClick={() =>
+                  void runStateAction(
+                    'check-app-update',
+                    () => window.cliproxy.checkAppUpdate(),
+                    '已检查桌面应用更新',
+                  )
+                }
+                type="button"
+              >
+                <RefreshCcw size={16} />
+                检查更新
+              </button>
+              <button
+                className="primary-button"
+                disabled={!state.appUpdate.updateAvailable}
+                onClick={() =>
+                  void runStateAction(
+                    'update-app',
+                    () => window.cliproxy.updateApp(),
+                    '已下载并打开最新安装包',
+                  )
+                }
+                type="button"
+              >
+                <Download size={16} />
+                执行更新
+              </button>
+            </div>
+            <div className="metric-pairs">
+              <span>上次检查 {formatTime(state.appUpdate.lastCheckedAt)}</span>
+              <span>上次下载 {formatTime(state.appUpdate.lastDownloadedAt)}</span>
+            </div>
+            {state.appUpdate.lastError ? (
+              <span className="field-help">更新异常：{state.appUpdate.lastError}</span>
+            ) : null}
+          </article>
         </section>
 
         <section className="dashboard-grid">

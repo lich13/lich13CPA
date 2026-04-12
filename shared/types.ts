@@ -424,6 +424,17 @@ export interface ProxyBinaryState {
   lastError: string | null
 }
 
+export interface AppUpdateState {
+  currentVersion: string
+  latestVersion: string | null
+  latestTag: string | null
+  latestAssetName: string | null
+  updateAvailable: boolean | null
+  lastCheckedAt: string | null
+  lastDownloadedAt: string | null
+  lastError: string | null
+}
+
 export interface AppPaths {
   baseDir: string
   configPath: string
@@ -438,6 +449,7 @@ export interface DesktopAppState {
   paths: AppPaths
   proxyStatus: ProxyStatus
   proxyBinary: ProxyBinaryState
+  appUpdate: AppUpdateState
   knownSettings: KnownSettings
   configText: string
   configMtimeMs: number
@@ -467,6 +479,8 @@ export interface DesktopBridge {
   ) => Promise<ProviderAuthStatusResult>
   checkProxyBinaryUpdate: () => Promise<DesktopAppState>
   updateProxyBinary: () => Promise<DesktopAppState>
+  checkAppUpdate: () => Promise<DesktopAppState>
+  updateApp: () => Promise<DesktopAppState>
   pickAuthFiles: (providerHint?: string) => Promise<DesktopAppState>
   deleteAuthFile: (name: string) => Promise<DesktopAppState>
   toggleAuthFile: (name: string) => Promise<DesktopAppState>

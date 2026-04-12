@@ -45,6 +45,8 @@ function createUnavailableBridge(): DesktopBridge {
     checkProviderAuthStatus: () => unavailable<ProviderAuthStatusResult>(),
     checkProxyBinaryUpdate: () => unavailable<DesktopAppState>(),
     updateProxyBinary: () => unavailable<DesktopAppState>(),
+    checkAppUpdate: () => unavailable<DesktopAppState>(),
+    updateApp: () => unavailable<DesktopAppState>(),
     pickAuthFiles: () => unavailable<DesktopAppState>(),
     deleteAuthFile: () => unavailable<DesktopAppState>(),
     toggleAuthFile: () => unavailable<DesktopAppState>(),
@@ -107,6 +109,8 @@ function createTauriBridge(): DesktopBridge {
       invoke<ProviderAuthStatusResult>('check_provider_auth_status', { provider, state }),
     checkProxyBinaryUpdate: () => invoke<DesktopAppState>('check_proxy_binary_update'),
     updateProxyBinary: () => invoke<DesktopAppState>('update_proxy_binary'),
+    checkAppUpdate: () => invoke<DesktopAppState>('check_app_update'),
+    updateApp: () => invoke<DesktopAppState>('update_app'),
     pickAuthFiles: (providerHint?: string) =>
       invoke<DesktopAppState>('pick_auth_files', { providerHint: providerHint ?? null }),
     deleteAuthFile: (name: string) => invoke<DesktopAppState>('delete_auth_file', { name }),

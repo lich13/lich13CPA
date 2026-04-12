@@ -11,6 +11,7 @@
   "scripts": {
     "dev": "npm run tauri:dev",
     "dev:renderer": "vite",
+    "app:version:set": "node scripts/set-app-version.mjs",
     "usage:pricing:update": "node scripts/update-usage-pricing.mjs",
     "tauri:prepare:host": "node scripts/prepare-tauri-bundled-binary.mjs",
     "tauri:prepare:mac:arm64": "node scripts/prepare-tauri-bundled-binary.mjs --target aarch64-apple-darwin",
