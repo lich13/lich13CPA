@@ -6,8 +6,9 @@
 
 - 前端在 `src/`
 - Rust 后端在 `src-tauri/src/`
-- Tauri 构建会在打包前自动从 `router-for-me/CLIProxyAPI` 的最新 release 拉取对应目标平台二进制
+- Tauri 构建默认会从 `router-for-me/CLIProxyAPI` 的最新 release 拉取对应目标平台二进制
 - 拉取到的二进制会被放进 `src-tauri/resources/bin/`，并作为 Tauri bundle resource 一起打包
+- 应用内可在设置页切换到 `CLIProxyAPIPlus` 通道，后续“检查更新 / 执行更新”会改走 Plus release
 
 ## 本地开发
 

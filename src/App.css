@@ -276,19 +276,27 @@
 
 .metrics-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 14px;
+  align-items: stretch;
 }
 
 .metric-card,
 .section-card {
   border-radius: 24px;
-  padding: 22px;
+  padding: 18px;
 }
 
 .metric-card {
   display: grid;
-  gap: 10px;
+  gap: 8px;
+  align-content: start;
+  min-width: 0;
+  min-height: 204px;
+}
+
+.metric-card-wide {
+  grid-column: span 2;
 }
 
 .metric-card-highlight {
@@ -298,12 +306,20 @@
 }
 
 .metric-card strong {
-  font-size: 1.6rem;
+  font-size: 1.42rem;
+  overflow-wrap: anywhere;
+  line-height: 1.2;
 }
 
 .metric-label {
   color: #ffcb96;
   font-size: 0.92rem;
+}
+
+.metric-copy-stack {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
 }
 
 .metric-help,
@@ -325,6 +341,37 @@
 .auth-metrics,
 .supplier-stats {
   flex-wrap: wrap;
+}
+
+.metric-pairs-compact {
+  font-size: 0.86rem;
+  row-gap: 6px;
+}
+
+.metric-help {
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.metric-action-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  align-items: stretch;
+}
+
+.metric-action-grid .primary-button,
+.metric-action-grid .ghost-button {
+  width: 100%;
+  min-width: 0;
+  min-height: 48px;
+  justify-content: center;
+  text-align: center;
+  white-space: normal;
+}
+
+.metric-card > .action-row {
+  margin-top: auto;
 }
 
 .section-card,
@@ -544,6 +591,10 @@
 .detail-grid,
 .meta-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.form-grid.two-columns > .inline-note {
+  grid-column: 1 / -1;
 }
 
 .auth-card {
@@ -1334,14 +1385,26 @@
   align-items: stretch;
 }
 
+.dashboard-action-grid-compact {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
 .dashboard-action-grid .primary-button,
 .dashboard-action-grid .ghost-button {
   width: 100%;
   min-width: 0;
-  min-height: 52px;
+  min-height: 46px;
   justify-content: center;
   text-align: center;
-  white-space: nowrap;
+  white-space: normal;
+}
+
+.dashboard-action-grid-compact .primary-button,
+.dashboard-action-grid-compact .ghost-button {
+  min-height: 42px;
+  padding: 9px 12px;
+  font-size: 0.92rem;
 }
 
 .quota-section-head {
@@ -1424,9 +1487,14 @@
   .usage-pricing-header-grid,
   .usage-pricing-rule-grid,
   .dashboard-action-grid,
+  .metric-action-grid,
   .auth-file-simple-grid,
   .auth-files-summary-grid {
     grid-template-columns: 1fr;
+  }
+
+  .metric-card-wide {
+    grid-column: auto;
   }
 
   .auth-card-path {
@@ -1459,5 +1527,21 @@
 
   .usage-range-meta .primary-button {
     margin-left: 0;
+  }
+}
+
+@media (max-width: 1450px) {
+  .metrics-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .dashboard-action-grid-compact {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 1320px) {
+  .metrics-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }

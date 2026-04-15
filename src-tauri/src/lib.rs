@@ -245,6 +245,7 @@ pub fn run() {
             });
             build_tray(&app.handle(), backend.clone())?;
             tauri::async_runtime::block_on(backend.initialize())?;
+            backend.restore_main_window_state();
             let _ = sync_tray(&app.handle(), &backend);
             Ok(())
         })
@@ -253,8 +254,17 @@ pub fn run() {
                 return;
             }
 
+            let backend = window.app_handle().state::<Backend>();
+
+            match event {
+                WindowEvent::Resized(_) | WindowEvent::Moved(_) => {
+                    backend.persist_main_window_state();
+                }
+                _ => {}
+            }
+
             if let WindowEvent::CloseRequested { api, .. } = event {
-                let backend = window.app_handle().state::<Backend>();
+                backend.persist_main_window_state();
                 if !backend.quit_requested() && backend.minimize_to_tray_on_close() {
                     api.prevent_close();
                     let _ = window.hide();

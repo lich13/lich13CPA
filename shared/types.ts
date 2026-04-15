@@ -1,8 +1,6 @@
 export type AppPage = 'dashboard' | 'providers' | 'auth-files' | 'usage' | 'logs' | 'settings'
 
-export type ThinkingBudgetMode = 'low' | 'medium' | 'high' | 'custom'
-
-export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+export type SidecarChannel = 'main' | 'plus'
 
 export type LogLevel = 'info' | 'warn' | 'error' | 'debug'
 
@@ -19,9 +17,7 @@ export interface KnownSettings {
   streamKeepaliveSeconds: number
   streamBootstrapRetries: number
   nonStreamKeepaliveIntervalSeconds: number
-  thinkingBudgetMode: ThinkingBudgetMode
-  thinkingBudgetCustom: number
-  reasoningEffort: ReasoningEffort
+  sidecarChannel: SidecarChannel
   autoSyncOnStop: boolean
   launchAtLogin: boolean
   autoStartProxyOnLaunch: boolean
@@ -43,9 +39,7 @@ export interface SaveKnownSettingsInput {
   streamKeepaliveSeconds: number
   streamBootstrapRetries: number
   nonStreamKeepaliveIntervalSeconds: number
-  thinkingBudgetMode: ThinkingBudgetMode
-  thinkingBudgetCustom: number
-  reasoningEffort: ReasoningEffort
+  sidecarChannel: SidecarChannel
   autoSyncOnStop: boolean
   launchAtLogin: boolean
   autoStartProxyOnLaunch: boolean
@@ -415,9 +409,11 @@ export interface ProxyStatus {
 export interface ProxyBinaryState {
   path: string
   currentVersion: string | null
+  currentChannel: SidecarChannel | null
   currentBuildAt: string | null
   latestVersion: string | null
   latestTag: string | null
+  selectedChannel: SidecarChannel
   updateAvailable: boolean | null
   lastCheckedAt: string | null
   lastUpdatedAt: string | null

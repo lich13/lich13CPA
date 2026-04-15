@@ -40,6 +40,7 @@ import type {
   ProviderModelMapping,
   SaveAiProviderInput,
   SaveKnownSettingsInput,
+  SidecarChannel,
   UsagePoint,
   UsageModelSummary,
   UsagePricingConfig,
@@ -178,7 +179,7 @@ interface ToggleFieldProps {
 
 const DEFAULT_PORT = 8313
 const DEFAULT_REQUEST_RETRY = 5
-const DEFAULT_MAX_RETRY_INTERVAL = 3
+const DEFAULT_MAX_RETRY_INTERVAL = 30
 const DEFAULT_STREAM_KEEPALIVE_SECONDS = 20
 const DEFAULT_STREAM_BOOTSTRAP_RETRIES = 2
 const DEFAULT_NON_STREAM_KEEPALIVE_INTERVAL_SECONDS = 15
@@ -186,6 +187,10 @@ const DEFAULT_USAGE_PRESET: UsageSummaryQueryPreset = '7d'
 const USAGE_PRICING_STORAGE_KEY = 'lich13cpa:usage-pricing'
 const DEFAULT_USAGE_CURRENCY = '¤'
 const PRICING_REFERENCE_LINKS: UsagePricingSourceLink[] = USAGE_PRICING_REFERENCE_LINKS
+
+function getSidecarDisplayName(channel: SidecarChannel): string {
+  return channel === 'plus' ? 'CLIProxyAPIPlus' : 'CLIProxyAPI'
+}
 
 const EMPTY_SETTINGS: SaveKnownSettingsInput = {
   port: DEFAULT_PORT,
@@ -200,9 +205,7 @@ const EMPTY_SETTINGS: SaveKnownSettingsInput = {
   streamKeepaliveSeconds: DEFAULT_STREAM_KEEPALIVE_SECONDS,
   streamBootstrapRetries: DEFAULT_STREAM_BOOTSTRAP_RETRIES,
   nonStreamKeepaliveIntervalSeconds: DEFAULT_NON_STREAM_KEEPALIVE_INTERVAL_SECONDS,
-  thinkingBudgetMode: 'medium',
-  thinkingBudgetCustom: 16000,
-  reasoningEffort: 'xhigh',
+  sidecarChannel: 'main',
   autoSyncOnStop: true,
   launchAtLogin: true,
   autoStartProxyOnLaunch: true,
@@ -221,9 +224,9 @@ const PAGES: PageMeta[] = [
 ]
 
 const AI_PROVIDER_SECTIONS: ProviderSectionMeta[] = [
+  { kind: 'codex', title: 'Codex API 配置' },
   { kind: 'openai-compatibility', title: 'OpenAI 兼容提供商' },
   { kind: 'claude', title: 'Claude API 配置' },
-  { kind: 'codex', title: 'Codex API 配置' },
   { kind: 'gemini', title: 'Gemini API 配置' },
   { kind: 'vertex', title: 'Vertex API 配置' },
   { kind: 'ampcode', title: 'Ampcode' },
@@ -886,7 +889,8 @@ function toDateTimeLocalValue(value: Date): string {
 
 function createDefaultUsageCustomRange(): UsageCustomRangeDraft {
   const end = new Date()
-  const start = new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000)
+  const start = new Date(end)
+  start.setHours(0, 0, 0, 0)
 
   return {
     startAt: toDateTimeLocalValue(start),
@@ -1401,9 +1405,7 @@ function getSettingsFromState(state: DesktopAppState): SaveKnownSettingsInput {
     streamKeepaliveSeconds: state.knownSettings.streamKeepaliveSeconds,
     streamBootstrapRetries: state.knownSettings.streamBootstrapRetries,
     nonStreamKeepaliveIntervalSeconds: state.knownSettings.nonStreamKeepaliveIntervalSeconds,
-    thinkingBudgetMode: state.knownSettings.thinkingBudgetMode,
-    thinkingBudgetCustom: state.knownSettings.thinkingBudgetCustom,
-    reasoningEffort: state.knownSettings.reasoningEffort,
+    sidecarChannel: state.knownSettings.sidecarChannel,
     autoSyncOnStop: state.knownSettings.autoSyncOnStop,
     launchAtLogin: state.knownSettings.launchAtLogin,
     autoStartProxyOnLaunch: state.knownSettings.autoStartProxyOnLaunch,
@@ -2286,13 +2288,13 @@ async function loadState() {
     return (
       <div className="page-stack">
         <section className="metrics-grid">
-          <article className="metric-card">
+          <article className="metric-card metric-card-wide">
             <span className="metric-label">代理状态</span>
             <strong>{state.proxyStatus.running ? '运行中' : '未启动'}</strong>
             <span className="metric-help">
               端口 {state.proxyStatus.port} · PID {state.proxyStatus.pid ?? '未启动'}
             </span>
-            <div className="action-row dashboard-action-grid">
+            <div className="action-row dashboard-action-grid dashboard-action-grid-compact">
               <button
                 className="primary-button"
                 disabled={busyAction === 'start-proxy' || busyAction === 'stop-proxy'}
@@ -2372,11 +2374,17 @@ async function loadState() {
           <article className="metric-card">
             <span className="metric-label">二进制版本</span>
             <strong>{state.proxyBinary.currentVersion ?? '未识别'}</strong>
-            <span className="metric-help">
-              最新 {state.proxyBinary.latestVersion ?? '未检查'} · 路径{' '}
-              {state.proxyBinary.path ? '已就绪' : '未找到'}
-            </span>
-            <div className="action-row">
+            <div className="metric-copy-stack">
+              <span className="metric-help">
+                最新 {state.proxyBinary.latestVersion ?? '未检查'} · 路径{' '}
+                {state.proxyBinary.path ? '已就绪' : '未找到'}
+              </span>
+              <div className="metric-pairs metric-pairs-compact">
+                <span>当前 {state.proxyBinary.currentChannel ?? '未识别'}</span>
+                <span>目标 {state.proxyBinary.selectedChannel}</span>
+              </div>
+            </div>
+            <div className="action-row metric-action-grid">
               <button
                 className="ghost-button"
                 onClick={() =>
@@ -2398,7 +2406,7 @@ async function loadState() {
                   void runStateAction(
                     'update-binary',
                     () => window.cliproxy.updateProxyBinary(),
-                    'CLIProxyAPI 已更新',
+                    `${getSidecarDisplayName(state.knownSettings.sidecarChannel)} 已更新`,
                   )
                 }
                 type="button"
@@ -2412,11 +2420,17 @@ async function loadState() {
           <article className="metric-card">
             <span className="metric-label">软件更新</span>
             <strong>v{state.appUpdate.currentVersion}</strong>
-            <span className="metric-help">
-              最新 {state.appUpdate.latestVersion ? `v${state.appUpdate.latestVersion}` : '未检查'} · 资产{' '}
-              {state.appUpdate.latestAssetName ?? '未解析'}
-            </span>
-            <div className="action-row">
+            <div className="metric-copy-stack">
+              <span className="metric-help">
+                最新 {state.appUpdate.latestVersion ? `v${state.appUpdate.latestVersion}` : '未检查'} · 资产{' '}
+                {state.appUpdate.latestAssetName ?? '未解析'}
+              </span>
+              <div className="metric-pairs metric-pairs-compact">
+                <span>上次检查 {formatTime(state.appUpdate.lastCheckedAt)}</span>
+                <span>上次下载 {formatTime(state.appUpdate.lastDownloadedAt)}</span>
+              </div>
+            </div>
+            <div className="action-row metric-action-grid">
               <button
                 className="ghost-button"
                 onClick={() =>
@@ -2446,10 +2460,6 @@ async function loadState() {
                 <Download size={16} />
                 执行更新
               </button>
-            </div>
-            <div className="metric-pairs">
-              <span>上次检查 {formatTime(state.appUpdate.lastCheckedAt)}</span>
-              <span>上次下载 {formatTime(state.appUpdate.lastDownloadedAt)}</span>
             </div>
             {state.appUpdate.lastError ? (
               <span className="field-help">更新异常：{state.appUpdate.lastError}</span>
@@ -4279,7 +4289,7 @@ async function loadState() {
               value={settingsDraft.proxyPassword}
             />
             <TextField
-              help="失败请求的重试次数。"
+              help="失败请求的重试预算。429 / 403 / 408 / 5xx 都会消耗这里的次数，建议保持 5。"
               label="request-retry"
               min={0}
               onChange={(value) => {
@@ -4293,7 +4303,7 @@ async function loadState() {
               value={settingsDraft.requestRetry}
             />
             <TextField
-              help="重试间隔上限，单位秒。"
+              help="等待重试上限，单位秒。上游 Retry-After 超过这个值时通常不会等待，建议至少 30 秒。"
               label="max-retry-interval"
               min={0}
               onChange={(value) => {
@@ -4306,6 +4316,10 @@ async function loadState() {
               type="number"
               value={settingsDraft.maxRetryInterval}
             />
+            <div className="inline-note">
+              为了尽量规避 429，默认策略已调整为 `request-retry = 5`、`max-retry-interval = 30`。
+              如果仍然频繁触发限流，优先增大等待上限，再考虑继续增加重试次数。
+            </div>
             <TextField
               help="流式响应的 keepalive 秒数，0 表示关闭。"
               label="Keepalive 秒数"
@@ -4349,59 +4363,21 @@ async function loadState() {
               value={settingsDraft.nonStreamKeepaliveIntervalSeconds}
             />
             <SelectField
-              help="GUI 保存的默认推理强度偏好。"
-              label="Reasoning Effort"
+              help="默认使用 main 主线；切到 plus 后，检查更新和下载更新都会改走 CLIProxyAPIPlus。"
+              label="Sidecar 通道"
               onChange={(value) => {
                 setSettingsDirty(true)
                 setSettingsDraft((current) => ({
                   ...current,
-                  reasoningEffort: value as SaveKnownSettingsInput['reasoningEffort'],
+                  sidecarChannel: value as SaveKnownSettingsInput['sidecarChannel'],
                 }))
               }}
               options={[
-                { label: 'none', value: 'none' },
-                { label: 'minimal', value: 'minimal' },
-                { label: 'low', value: 'low' },
-                { label: 'medium', value: 'medium' },
-                { label: 'high', value: 'high' },
-                { label: 'xhigh', value: 'xhigh' },
+                { label: 'main', value: 'main' },
+                { label: 'plus', value: 'plus' },
               ]}
-              value={settingsDraft.reasoningEffort}
+              value={settingsDraft.sidecarChannel}
             />
-            <SelectField
-              help="为 Claude 思考预算生成默认规则。"
-              label="Thinking Budget"
-              onChange={(value) => {
-                setSettingsDirty(true)
-                setSettingsDraft((current) => ({
-                  ...current,
-                  thinkingBudgetMode: value as SaveKnownSettingsInput['thinkingBudgetMode'],
-                }))
-              }}
-              options={[
-                { label: 'low', value: 'low' },
-                { label: 'medium', value: 'medium' },
-                { label: 'high', value: 'high' },
-                { label: 'custom', value: 'custom' },
-              ]}
-              value={settingsDraft.thinkingBudgetMode}
-            />
-            {settingsDraft.thinkingBudgetMode === 'custom' ? (
-              <TextField
-                help="自定义 thinking.budget_tokens。"
-                label="Custom Budget"
-                min={1024}
-                onChange={(value) => {
-                  setSettingsDirty(true)
-                  setSettingsDraft((current) => ({
-                    ...current,
-                    thinkingBudgetCustom: Number.parseInt(value || '1024', 10) || 1024,
-                  }))
-                }}
-                type="number"
-                value={settingsDraft.thinkingBudgetCustom}
-              />
-            ) : null}
           </div>
 
           <div className="form-grid">

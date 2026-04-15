@@ -1,3 +1,5 @@
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
@@ -11,8 +13,6 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
@@ -25,11 +25,12 @@ use reqwest::{
     Client,
 };
 use rfd::FileDialog;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Number, Value};
 use sysproxy::Sysproxy;
 use tar::Archive;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size};
 use tauri_plugin_autostart::ManagerExt;
 use tempfile::TempDir;
 use url::Url;
@@ -54,29 +55,28 @@ const DESKTOP_METADATA_KEY: &str = "x-cliproxy-desktop";
 const MAIN_LOG_NAME: &str = "main.log";
 const AUTH_DIRECTORY_NAME: &str = "auth-files";
 const USAGE_STATS_FILE_NAME: &str = "usage-stats.json";
+const USAGE_DB_FILE_NAME: &str = "usage-stats.sqlite3";
 const DEFAULT_PORT: u16 = 8313;
 const DEFAULT_PROXY_API_KEY: &str = "cliproxy-local";
 const DEFAULT_MANAGEMENT_API_KEY: &str = "cliproxy-management";
 const DEFAULT_REQUEST_RETRY: u16 = 5;
-const DEFAULT_MAX_RETRY_INTERVAL: u16 = 3;
+const DEFAULT_MAX_RETRY_INTERVAL: u16 = 30;
 const DEFAULT_STREAM_KEEPALIVE_SECONDS: u16 = 20;
 const DEFAULT_STREAM_BOOTSTRAP_RETRIES: u16 = 2;
 const DEFAULT_NON_STREAM_KEEPALIVE_INTERVAL_SECONDS: u16 = 15;
-const DEFAULT_THINKING_CUSTOM: u32 = 16000;
 const DEFAULT_LOGS_MAX_TOTAL_SIZE_MB: u32 = 400;
 const MAX_LOG_ENTRIES: usize = 600;
 const MAX_USAGE_PROCESSED_FILE_IDS: usize = 6000;
 const MIN_USAGE_LOG_FILE_AGE_MS: u64 = 1500;
-const MANAGED_REASONING_EFFORT_MARKER: &str = "x-cliproxy-desktop-reasoning-effort";
-const CLIPROXY_REPOSITORY: &str = "router-for-me/CLIProxyAPI";
-const CLIPROXY_RELEASES_LATEST_URL: &str =
-    "https://github.com/router-for-me/CLIProxyAPI/releases/latest";
-const CLIPROXY_RELEASES_LATEST_API_URL: &str =
-    "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest";
+const CLIPROXY_MAIN_REPOSITORY: &str = "router-for-me/CLIProxyAPI";
+const CLIPROXY_PLUS_REPOSITORY: &str = "router-for-me/CLIProxyAPIPlus";
+const SIDECAR_CHANNEL_MAIN: &str = "main";
+const SIDECAR_CHANNEL_PLUS: &str = "plus";
 const DESKTOP_APP_RELEASES_LATEST_URL: &str = "https://github.com/lich13/lich13CPA/releases/latest";
 const DESKTOP_APP_RELEASES_LATEST_API_URL: &str =
     "https://api.github.com/repos/lich13/lich13CPA/releases/latest";
 const DEFAULT_PROXY_CHECK_URL: &str = "https://example.com";
+const MAIN_WINDOW_LABEL: &str = "main";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
@@ -116,27 +116,60 @@ const PROVIDER_AUTH_ENDPOINTS: &[(&str, &str)] = &[
     ),
 ];
 
-const SONNET_THINKING_MODELS: &[&str] = &[
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-5-thinking",
-    "gemini-claude-sonnet-4-5",
-    "gemini-claude-sonnet-4-5-thinking",
-    "claude-sonnet-4-6",
-    "claude-sonnet-4-6-thinking",
-    "gemini-claude-sonnet-4-6",
-    "gemini-claude-sonnet-4-6-thinking",
-];
+fn default_sidecar_channel_string() -> String {
+    SIDECAR_CHANNEL_MAIN.to_string()
+}
 
-const OPUS_THINKING_MODELS: &[&str] = &[
-    "claude-opus-4-5",
-    "claude-opus-4-5-thinking",
-    "gemini-claude-opus-4-5",
-    "gemini-claude-opus-4-5-thinking",
-    "claude-opus-4-6",
-    "claude-opus-4-6-thinking",
-    "gemini-claude-opus-4-6",
-    "gemini-claude-opus-4-6-thinking",
-];
+fn normalize_sidecar_channel(value: &str) -> &'static str {
+    if value.trim().eq_ignore_ascii_case(SIDECAR_CHANNEL_PLUS) {
+        SIDECAR_CHANNEL_PLUS
+    } else {
+        SIDECAR_CHANNEL_MAIN
+    }
+}
+
+fn sidecar_repository(channel: &str) -> &'static str {
+    match normalize_sidecar_channel(channel) {
+        SIDECAR_CHANNEL_PLUS => CLIPROXY_PLUS_REPOSITORY,
+        _ => CLIPROXY_MAIN_REPOSITORY,
+    }
+}
+
+fn sidecar_asset_prefix(channel: &str) -> &'static str {
+    match normalize_sidecar_channel(channel) {
+        SIDECAR_CHANNEL_PLUS => "CLIProxyAPIPlus",
+        _ => "CLIProxyAPI",
+    }
+}
+
+fn sidecar_display_name(channel: &str) -> &'static str {
+    sidecar_asset_prefix(channel)
+}
+
+fn sidecar_releases_latest_url(channel: &str) -> String {
+    format!(
+        "https://github.com/{}/releases/latest",
+        sidecar_repository(channel)
+    )
+}
+
+fn sidecar_releases_latest_api_url(channel: &str) -> String {
+    format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        sidecar_repository(channel)
+    )
+}
+
+fn detect_sidecar_channel_from_version(version: Option<&str>) -> &'static str {
+    let Some(version) = version else {
+        return SIDECAR_CHANNEL_MAIN;
+    };
+    if version.to_ascii_lowercase().contains("plus") {
+        SIDECAR_CHANNEL_PLUS
+    } else {
+        SIDECAR_CHANNEL_MAIN
+    }
+}
 
 const CLAUDE_USAGE_WINDOW_KEYS: &[(&str, &str, &str)] = &[
     ("five_hour", "5 小时", "five-hour"),
@@ -170,7 +203,10 @@ const ANTIGRAVITY_QUOTA_URLS: &[&str] = &[
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GuiState {
-    reasoning_effort: String,
+    #[serde(default = "default_sidecar_channel_string")]
+    sidecar_channel: String,
+    #[serde(default)]
+    window_state: Option<PersistedWindowState>,
     proxy_binary_path: String,
     auto_sync_on_stop: bool,
     management_api_key: String,
@@ -182,7 +218,8 @@ struct GuiState {
 impl Default for GuiState {
     fn default() -> Self {
         Self {
-            reasoning_effort: "xhigh".to_string(),
+            sidecar_channel: SIDECAR_CHANNEL_MAIN.to_string(),
+            window_state: None,
             proxy_binary_path: String::new(),
             auto_sync_on_stop: true,
             management_api_key: DEFAULT_MANAGEMENT_API_KEY.to_string(),
@@ -191,6 +228,17 @@ impl Default for GuiState {
             minimize_to_tray_on_close: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PersistedWindowState {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    maximized: bool,
+    fullscreen: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -308,6 +356,7 @@ struct ResolvedPaths {
     auth_dir: PathBuf,
     logs_dir: PathBuf,
     usage_stats_path: PathBuf,
+    usage_db_path: PathBuf,
     binary_candidates: Vec<PathBuf>,
 }
 
@@ -404,6 +453,26 @@ struct BackendInner {
 }
 
 impl Backend {
+    fn cleanup_update_installers(&self, keep_asset_name: Option<&str>) -> Result<()> {
+        let updates_dir = self.inner.paths.base_dir.join("updates");
+        if !updates_dir.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(&updates_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+            if keep_asset_name.is_some_and(|keep| keep == name) {
+                continue;
+            }
+            let _ = fs::remove_file(path);
+        }
+        Ok(())
+    }
+
     pub fn new(app: AppHandle) -> Result<Self> {
         let client = Client::builder()
             .user_agent("CLIProxy Desktop")
@@ -433,6 +502,7 @@ impl Backend {
 
     pub async fn initialize(&self) -> Result<()> {
         self.ensure_app_files()?;
+        self.cleanup_update_installers(None).ok();
         self.reload_logs_from_disk()?;
         self.start_watchers()?;
 
@@ -464,6 +534,17 @@ impl Backend {
                     app_update.last_error = Some(error.to_string());
                 }
                 backend.append_log("warn", "app", &format!("桌面应用更新检查失败：{error}"));
+            } else {
+                let latest_asset_name = backend
+                    .inner
+                    .app_update
+                    .lock()
+                    .unwrap()
+                    .latest_asset_name
+                    .clone();
+                if let Err(error) = backend.cleanup_update_installers(latest_asset_name.as_deref()) {
+                    backend.append_log("warn", "app", &format!("清理旧安装包失败：{error}"));
+                }
             }
             backend.emit_state_changed();
         });
@@ -498,6 +579,68 @@ impl Backend {
         self.read_gui_state()
             .map(|state| state.minimize_to_tray_on_close)
             .unwrap_or(true)
+    }
+
+    pub fn restore_main_window_state(&self) {
+        let Some(window) = self.inner.app.get_webview_window(MAIN_WINDOW_LABEL) else {
+            return;
+        };
+        let Some(state) = self
+            .read_gui_state()
+            .ok()
+            .and_then(|gui_state| gui_state.window_state)
+        else {
+            return;
+        };
+
+        if state.width > 0 && state.height > 0 {
+            let _ = window.set_size(Size::Physical(PhysicalSize::new(state.width, state.height)));
+        }
+        let _ = window.set_position(Position::Physical(PhysicalPosition::new(
+            state.x, state.y,
+        )));
+        if state.fullscreen {
+            let _ = window.set_fullscreen(true);
+        } else if state.maximized {
+            let _ = window.maximize();
+        }
+    }
+
+    pub fn persist_main_window_state(&self) {
+        let Some(window) = self.inner.app.get_webview_window(MAIN_WINDOW_LABEL) else {
+            return;
+        };
+        self.persist_window_state(&window);
+    }
+
+    pub fn persist_window_state<R: tauri::Runtime>(&self, window: &tauri::WebviewWindow<R>) {
+        let Some(next_state) = self.capture_window_state(window) else {
+            return;
+        };
+        let Ok(mut gui_state) = self.read_gui_state() else {
+            return;
+        };
+        if gui_state.window_state.as_ref() == Some(&next_state) {
+            return;
+        }
+        gui_state.window_state = Some(next_state);
+        let _ = self.write_gui_state_partial(gui_state);
+    }
+
+    fn capture_window_state<R: tauri::Runtime>(
+        &self,
+        window: &tauri::WebviewWindow<R>,
+    ) -> Option<PersistedWindowState> {
+        let position = window.outer_position().ok()?;
+        let size = window.outer_size().ok()?;
+        Some(PersistedWindowState {
+            x: position.x,
+            y: position.y,
+            width: size.width,
+            height: size.height,
+            maximized: window.is_maximized().ok().unwrap_or(false),
+            fullscreen: window.is_fullscreen().ok().unwrap_or(false),
+        })
     }
 
     pub fn proxy_running(&self) -> bool {
@@ -550,8 +693,10 @@ impl Backend {
         let raw = self.read_config_text()?;
         let mut config = parse_config_object(&raw)?;
         let mut gui_state = self.read_gui_state()?;
+        let previous_sidecar_channel = normalize_sidecar_channel(&gui_state.sidecar_channel);
 
         apply_known_settings(self, &mut config, &input)?;
+        strip_managed_thinking_entries(&mut config);
         gui_state.auto_sync_on_stop =
             read_bool(input.get("autoSyncOnStop"), gui_state.auto_sync_on_stop);
         gui_state.launch_at_login =
@@ -560,8 +705,11 @@ impl Backend {
             input.get("autoStartProxyOnLaunch"),
             gui_state.auto_start_proxy_on_launch,
         );
-        gui_state.reasoning_effort =
-            read_string(input.get("reasoningEffort"), &gui_state.reasoning_effort);
+        gui_state.sidecar_channel = normalize_sidecar_channel(&read_string(
+            input.get("sidecarChannel"),
+            &gui_state.sidecar_channel,
+        ))
+        .to_string();
         gui_state.minimize_to_tray_on_close = read_bool(
             input.get("minimizeToTrayOnClose"),
             gui_state.minimize_to_tray_on_close,
@@ -569,6 +717,29 @@ impl Backend {
 
         self.write_config_object(&config)?;
         self.write_gui_state_partial(gui_state)?;
+        if previous_sidecar_channel
+            != normalize_sidecar_channel(&read_string(
+                input.get("sidecarChannel"),
+                previous_sidecar_channel,
+            ))
+        {
+            {
+                let mut binary = self.inner.proxy_binary.lock().unwrap();
+                binary.latest_version = None;
+                binary.latest_tag = None;
+                binary.update_available = None;
+                binary.last_checked_at = None;
+                binary.last_error = None;
+            }
+            if let Err(error) = self.refresh_proxy_binary_state().await {
+                self.append_log(
+                    "warn",
+                    "app",
+                    &format!("切换 sidecar 通道后刷新版本状态失败：{error}"),
+                );
+                self.inner.proxy_binary.lock().unwrap().last_error = Some(error.to_string());
+            }
+        }
         self.sync_launch_at_login(read_bool(input.get("launchAtLogin"), true))
             .ok();
         self.emit_state_changed();
@@ -581,9 +752,13 @@ impl Backend {
         }
 
         self.ensure_app_files()?;
+        let gui_state = self.read_gui_state()?;
         let binary_path = self.ensure_proxy_binary_installed().await?;
         if binary_path.is_empty() {
-            return Err(anyhow!("没有找到可用的 CLIProxyAPI 二进制，请先检查设置。"));
+            return Err(anyhow!(
+                "没有找到可用的 {} 二进制，请先检查设置。",
+                sidecar_display_name(&gui_state.sidecar_channel)
+            ));
         }
 
         let (_, known_settings) = self.prepare_config_for_launch()?;
@@ -1264,6 +1439,7 @@ impl Backend {
     }
 
     pub async fn stop_proxy_and_quit(&self) -> Result<()> {
+        self.persist_main_window_state();
         let _ = self.stop_proxy().await;
         self.mark_quit_requested(true);
         self.inner.app.exit(0);
@@ -1368,14 +1544,12 @@ impl Backend {
             "proxyPassword": "",
             "proxyApiKey": "cliproxy-self-test",
             "managementApiKey": "cliproxy-management",
-            "requestRetry": 7,
-            "maxRetryInterval": 5,
+            "requestRetry": 5,
+            "maxRetryInterval": 30,
             "streamKeepaliveSeconds": 25,
             "streamBootstrapRetries": 3,
             "nonStreamKeepaliveIntervalSeconds": 20,
-            "thinkingBudgetMode": "custom",
-            "thinkingBudgetCustom": 12288,
-            "reasoningEffort": "high",
+            "sidecarChannel": "main",
             "autoSyncOnStop": true,
             "launchAtLogin": false,
             "autoStartProxyOnLaunch": false,
@@ -1387,7 +1561,6 @@ impl Backend {
                 "ok",
                 json!({
                     "port": state.pointer("/knownSettings/port").cloned().unwrap_or(Value::Null),
-                    "reasoningEffort": state.pointer("/knownSettings/reasoningEffort").cloned().unwrap_or(Value::Null),
                     "apiBaseUrl": state.pointer("/knownSettings/apiBaseUrl").cloned().unwrap_or(Value::Null),
                 }),
             ),
@@ -1963,6 +2136,19 @@ impl Backend {
 
         if !self.inner.paths.config_path.exists() {
             self.write_config_object(&create_default_config(&self.inner.paths))?;
+        } else if let Ok(raw_config) = fs::read_to_string(&self.inner.paths.config_path) {
+            if let Ok(mut config) = parse_config_object(&raw_config) {
+                let mut changed = false;
+                if strip_managed_reasoning_effort_entries(&mut config) {
+                    changed = true;
+                }
+                if strip_managed_thinking_entries(&mut config) {
+                    changed = true;
+                }
+                if changed {
+                    self.write_config_object(&config)?;
+                }
+            }
         }
         if !self.inner.paths.gui_state_path.exists() {
             self.write_gui_state_partial(GuiState::default())?;
@@ -2067,29 +2253,176 @@ impl Backend {
         Ok(())
     }
 
-    fn read_persisted_usage_state(&self) -> Result<PersistedUsageState> {
-        if let Some(cached) = self.inner.usage_state_cache.lock().unwrap().clone() {
-            return Ok(cached);
+    fn open_usage_db(&self) -> Result<Connection> {
+        Ok(Connection::open(&self.inner.paths.usage_db_path)?)
+    }
+
+    fn ensure_usage_db_schema(&self, conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS usage_meta (
+              key TEXT PRIMARY KEY,
+              value TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS usage_processed_files (
+              seq INTEGER PRIMARY KEY,
+              file_id TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS usage_records (
+              record_id TEXT PRIMARY KEY,
+              model TEXT NOT NULL,
+              timestamp TEXT,
+              timestamp_ms INTEGER,
+              total_tokens INTEGER NOT NULL,
+              input_tokens INTEGER NOT NULL,
+              output_tokens INTEGER NOT NULL,
+              cached_tokens INTEGER NOT NULL,
+              cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+              reasoning_tokens INTEGER NOT NULL,
+              failed INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_usage_records_timestamp_ms ON usage_records(timestamp_ms);
+            CREATE INDEX IF NOT EXISTS idx_usage_records_model ON usage_records(model);
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn ensure_usage_database(&self) -> Result<()> {
+        let conn = self.open_usage_db()?;
+        self.ensure_usage_db_schema(&conn)?;
+        let has_data: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM usage_records LIMIT 1) OR EXISTS(SELECT 1 FROM usage_processed_files LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_data {
+            return Ok(());
         }
-        let next = match fs::read_to_string(&self.inner.paths.usage_stats_path) {
+
+        let legacy_state = match fs::read_to_string(&self.inner.paths.usage_stats_path) {
             Ok(raw) => serde_json::from_str::<PersistedUsageState>(&raw).unwrap_or_default(),
             Err(_) => PersistedUsageState::default(),
         };
-        *self.inner.usage_state_cache.lock().unwrap() = Some(next.clone());
-        Ok(next)
+        if legacy_state.records.is_empty() && legacy_state.processed_file_ids.is_empty() {
+            return Ok(());
+        }
+        self.write_usage_state_to_db(&conn, &legacy_state)?;
+        Ok(())
     }
 
-    fn write_persisted_usage_state(&self, state: &PersistedUsageState) -> Result<()> {
+    fn read_usage_state_from_db(&self, conn: &Connection) -> Result<PersistedUsageState> {
+        let updated_at = conn
+            .query_row(
+                "SELECT value FROM usage_meta WHERE key = 'updated_at'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        let mut processed_stmt =
+            conn.prepare("SELECT file_id FROM usage_processed_files ORDER BY seq ASC")?;
+        let processed_file_ids = processed_stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut records_stmt = conn.prepare(
+            "SELECT record_id, model, timestamp, timestamp_ms, total_tokens, input_tokens, output_tokens, cached_tokens, cache_creation_tokens, reasoning_tokens, failed FROM usage_records ORDER BY COALESCE(timestamp_ms, 0) ASC, record_id ASC",
+        )?;
+        let records = records_stmt
+            .query_map([], |row| {
+                Ok(PersistedUsageRecord {
+                    record_id: row.get(0)?,
+                    model: row.get(1)?,
+                    timestamp: row.get(2)?,
+                    timestamp_ms: row.get(3)?,
+                    total_tokens: row.get(4)?,
+                    input_tokens: row.get(5)?,
+                    output_tokens: row.get(6)?,
+                    cached_tokens: row.get(7)?,
+                    cache_creation_tokens: row.get(8)?,
+                    reasoning_tokens: row.get(9)?,
+                    failed: row.get::<_, i64>(10)? != 0,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(PersistedUsageState {
+            version: 2,
+            updated_at,
+            processed_file_ids,
+            records,
+        })
+    }
+
+    fn write_usage_state_to_db(
+        &self,
+        conn: &Connection,
+        state: &PersistedUsageState,
+    ) -> Result<PersistedUsageState> {
         let mut next = state.clone();
         next.updated_at = Some(now_iso());
         if next.processed_file_ids.len() > MAX_USAGE_PROCESSED_FILE_IDS {
             let keep_from = next.processed_file_ids.len() - MAX_USAGE_PROCESSED_FILE_IDS;
             next.processed_file_ids = next.processed_file_ids[keep_from..].to_vec();
         }
-        fs::write(
-            &self.inner.paths.usage_stats_path,
-            serde_json::to_vec_pretty(&next)?,
+
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM usage_meta", [])?;
+        tx.execute("DELETE FROM usage_processed_files", [])?;
+        tx.execute("DELETE FROM usage_records", [])?;
+        tx.execute(
+            "INSERT INTO usage_meta (key, value) VALUES ('updated_at', ?1)",
+            params![next.updated_at.clone()],
         )?;
+
+        for (index, file_id) in next.processed_file_ids.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO usage_processed_files (seq, file_id) VALUES (?1, ?2)",
+                params![index as i64, file_id],
+            )?;
+        }
+
+        for record in &next.records {
+            tx.execute(
+                "INSERT INTO usage_records (record_id, model, timestamp, timestamp_ms, total_tokens, input_tokens, output_tokens, cached_tokens, cache_creation_tokens, reasoning_tokens, failed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    record.record_id,
+                    record.model,
+                    record.timestamp,
+                    record.timestamp_ms,
+                    record.total_tokens,
+                    record.input_tokens,
+                    record.output_tokens,
+                    record.cached_tokens,
+                    record.cache_creation_tokens,
+                    record.reasoning_tokens,
+                    if record.failed { 1i64 } else { 0i64 },
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(next)
+    }
+
+    fn read_persisted_usage_state(&self) -> Result<PersistedUsageState> {
+        if let Some(cached) = self.inner.usage_state_cache.lock().unwrap().clone() {
+            return Ok(cached);
+        }
+        self.ensure_usage_database()?;
+        let conn = self.open_usage_db()?;
+        let next = self.read_usage_state_from_db(&conn)?;
+        *self.inner.usage_state_cache.lock().unwrap() = Some(next.clone());
+        Ok(next)
+    }
+
+    fn write_persisted_usage_state(&self, state: &PersistedUsageState) -> Result<()> {
+        self.ensure_usage_database()?;
+        let conn = self.open_usage_db()?;
+        let next = self.write_usage_state_to_db(&conn, state)?;
         *self.inner.usage_state_cache.lock().unwrap() = Some(next);
         Ok(())
     }
@@ -2323,8 +2656,11 @@ impl Backend {
         self.ensure_app_files()?;
         let initial_gui_state = self.read_gui_state()?;
         let effective_binary_path = self.resolve_binary_path(&initial_gui_state)?;
-        self.sync_proxy_binary_local_state(&effective_binary_path)
-            .ok();
+        self.sync_proxy_binary_local_state(
+            &effective_binary_path,
+            &initial_gui_state.sidecar_channel,
+        )
+        .ok();
         let raw_config_text = self.read_config_text()?;
         let config_mtime_ms = fs::metadata(&self.inner.paths.config_path)
             .ok()
@@ -2441,10 +2777,10 @@ impl Backend {
                 )));
             }
             if effective_binary_path.is_empty() {
-                warnings.push(Value::String(
-                    "尚未找到可用的 CLIProxyAPI 二进制，请重新构建应用或在设置页手动指定。"
-                        .to_string(),
-                ));
+                warnings.push(Value::String(format!(
+                    "尚未找到可用的 {} 二进制，请重新构建应用或在设置页手动指定。",
+                    sidecar_display_name(&gui_state.sidecar_channel)
+                )));
             }
             if !gui_state.proxy_binary_path.is_empty()
                 && !Path::new(&gui_state.proxy_binary_path).exists()
@@ -2488,9 +2824,11 @@ impl Backend {
           "proxyBinary": {
             "path": if binary.path.is_empty() { self.resolve_binary_path(&gui_state)? } else { binary.path.clone() },
             "currentVersion": binary.current_version,
+            "currentChannel": binary.current_version.as_deref().map(|value| detect_sidecar_channel_from_version(Some(value))),
             "currentBuildAt": binary.current_build_at,
             "latestVersion": binary.latest_version,
             "latestTag": binary.latest_tag,
+            "selectedChannel": normalize_sidecar_channel(&gui_state.sidecar_channel),
             "updateAvailable": binary.update_available,
             "lastCheckedAt": binary.last_checked_at,
             "lastUpdatedAt": binary.last_updated_at,
@@ -3088,11 +3426,11 @@ impl Backend {
                         });
                         existing_ids.insert(file_id.clone());
                     }
-                    store.processed_file_ids.push(file_id.clone());
-                    processed.insert(file_id);
-                    changed = true;
-                    let _ = fs::remove_file(&path);
                 }
+                store.processed_file_ids.push(file_id.clone());
+                processed.insert(file_id);
+                changed = true;
+                let _ = fs::remove_file(&path);
             }
         }
 
@@ -3169,7 +3507,11 @@ impl Backend {
         Ok((version, build_at))
     }
 
-    fn sync_proxy_binary_local_state(&self, binary_path: &str) -> Result<()> {
+    fn sync_proxy_binary_local_state(
+        &self,
+        binary_path: &str,
+        selected_channel: &str,
+    ) -> Result<()> {
         let mut binary = self.inner.proxy_binary.lock().unwrap();
         binary.path = binary_path.to_string();
         if binary_path.is_empty() || !Path::new(binary_path).exists() {
@@ -3180,6 +3522,7 @@ impl Backend {
                 false,
                 binary.current_version.clone(),
                 binary.latest_version.clone(),
+                selected_channel,
             );
             return Ok(());
         }
@@ -3188,16 +3531,21 @@ impl Backend {
         binary.current_version = version.clone();
         binary.current_build_at = build_at;
         binary.last_updated_at = system_time_to_iso(metadata.modified().ok());
-        binary.update_available =
-            compute_proxy_binary_update_available(true, version, binary.latest_version.clone());
+        binary.update_available = compute_proxy_binary_update_available(
+            true,
+            version,
+            binary.latest_version.clone(),
+            selected_channel,
+        );
         Ok(())
     }
 
     async fn refresh_proxy_binary_state(&self) -> Result<()> {
         let gui_state = self.read_gui_state()?;
         let effective_binary_path = self.resolve_binary_path(&gui_state)?;
-        self.sync_proxy_binary_local_state(&effective_binary_path)?;
-        let descriptor = fetch_latest_release_descriptor(&self.inner.client).await?;
+        self.sync_proxy_binary_local_state(&effective_binary_path, &gui_state.sidecar_channel)?;
+        let descriptor =
+            fetch_latest_release_descriptor(&self.inner.client, &gui_state.sidecar_channel).await?;
         let mut binary = self.inner.proxy_binary.lock().unwrap();
         binary.latest_tag = Some(descriptor.tag.clone());
         binary.latest_version = Some(descriptor.version.clone());
@@ -3207,6 +3555,7 @@ impl Backend {
             !effective_binary_path.is_empty(),
             binary.current_version.clone(),
             Some(descriptor.version),
+            &gui_state.sidecar_channel,
         );
         Ok(())
     }
@@ -3218,6 +3567,7 @@ impl Backend {
     async fn refresh_app_update_state(&self) -> Result<()> {
         let current_version = self.current_app_version();
         let descriptor = fetch_latest_app_release_descriptor(&self.inner.client).await?;
+        self.cleanup_update_installers(Some(&descriptor.asset_name)).ok();
         let mut app_update = self.inner.app_update.lock().unwrap();
         app_update.current_version = current_version.clone();
         app_update.latest_tag = Some(descriptor.tag.clone());
@@ -3242,6 +3592,7 @@ impl Backend {
 
         let updates_dir = self.inner.paths.base_dir.join("updates");
         fs::create_dir_all(&updates_dir)?;
+        self.cleanup_update_installers(Some(&descriptor.asset_name)).ok();
         let installer_path = updates_dir.join(&descriptor.asset_name);
 
         self.append_log(
@@ -3322,20 +3673,30 @@ impl Backend {
 
     async fn update_proxy_binary_internal(&self) -> Result<String> {
         let was_running = self.is_proxy_running();
+        let sidecar_channel = self.read_gui_state()?.sidecar_channel;
         if was_running {
             self.stop_proxy().await?;
         }
         let installed_path = self.install_proxy_binary().await?;
         if was_running {
             self.start_proxy().await?;
-            self.append_log("info", "app", "CLIProxyAPI 更新完成，代理已自动重新启动。");
+            self.append_log(
+                "info",
+                "app",
+                &format!(
+                    "{} 更新完成，代理已自动重新启动。",
+                    sidecar_display_name(&sidecar_channel)
+                ),
+            );
         }
         Ok(installed_path)
     }
 
     async fn install_proxy_binary(&self) -> Result<String> {
-        let descriptor = fetch_latest_release_descriptor(&self.inner.client).await?;
         let gui_state = self.read_gui_state()?;
+        let sidecar_channel = normalize_sidecar_channel(&gui_state.sidecar_channel);
+        let descriptor =
+            fetch_latest_release_descriptor(&self.inner.client, &gui_state.sidecar_channel).await?;
         let effective = self.resolve_binary_path(&gui_state)?;
         let target = if !effective.is_empty() {
             PathBuf::from(&effective)
@@ -3351,8 +3712,10 @@ impl Backend {
             "info",
             "app",
             &format!(
-                "开始下载 CLIProxyAPI {}：{}",
-                descriptor.version, descriptor.asset_name
+                "开始下载 {} {}：{}",
+                sidecar_display_name(sidecar_channel),
+                descriptor.version,
+                descriptor.asset_name
             ),
         );
 
@@ -3374,7 +3737,10 @@ impl Backend {
                 self.append_log(
                     "warn",
                     "app",
-                    &format!("直接下载 CLIProxyAPI 失败，回退到 curl：{error}"),
+                    &format!(
+                        "直接下载 {} 失败，回退到 curl：{error}",
+                        sidecar_display_name(sidecar_channel)
+                    ),
                 );
                 let status = {
                     let mut curl_command = Command::new("curl");
@@ -3386,11 +3752,17 @@ impl Backend {
                         .arg(&archive_path)
                         .arg(&descriptor.download_url)
                         .status()
-                        .with_context(|| "failed to execute curl for CLIProxyAPI download")?
+                        .with_context(|| {
+                            format!(
+                                "failed to execute curl for {} download",
+                                sidecar_display_name(sidecar_channel)
+                            )
+                        })?
                 };
                 if !status.success() {
                     return Err(anyhow!(
-                        "CLIProxyAPI 下载失败，curl 退出码 {:?}",
+                        "{} 下载失败，curl 退出码 {:?}",
+                        sidecar_display_name(sidecar_channel),
                         status.code()
                     ));
                 }
@@ -3418,7 +3790,7 @@ impl Backend {
             proxy_binary_path: target.to_string_lossy().to_string(),
             ..self.read_gui_state()?
         })?;
-        self.sync_proxy_binary_local_state(&target.to_string_lossy())?;
+        self.sync_proxy_binary_local_state(&target.to_string_lossy(), sidecar_channel)?;
         {
             let mut binary = self.inner.proxy_binary.lock().unwrap();
             if binary.current_version.is_none() {
@@ -3432,13 +3804,15 @@ impl Backend {
                 true,
                 binary.current_version.clone(),
                 binary.latest_version.clone(),
+                sidecar_channel,
             );
         }
         self.append_log(
             "info",
             "app",
             &format!(
-                "CLIProxyAPI 已更新到 {}：{}",
+                "{} 已更新到 {}：{}",
+                sidecar_display_name(sidecar_channel),
                 descriptor.version,
                 target.to_string_lossy()
             ),
@@ -3450,11 +3824,12 @@ impl Backend {
         let gui_state = self.read_gui_state()?;
         let effective = self.resolve_binary_path(&gui_state)?;
         if !effective.is_empty() {
-            self.sync_proxy_binary_local_state(&effective)?;
+            self.sync_proxy_binary_local_state(&effective, &gui_state.sidecar_channel)?;
             return Ok(effective);
         }
         Err(anyhow!(
-            "没有找到可用的 CLIProxyAPI 二进制，请重新构建应用或在设置页手动指定。"
+            "没有找到可用的 {} 二进制，请重新构建应用或在设置页手动指定。",
+            sidecar_display_name(&gui_state.sidecar_channel)
         ))
     }
 
@@ -3994,6 +4369,7 @@ fn resolve_paths(app: &AppHandle) -> ResolvedPaths {
         auth_dir: base_dir.join(AUTH_DIRECTORY_NAME),
         logs_dir: base_dir.join("logs"),
         usage_stats_path: base_dir.join(USAGE_STATS_FILE_NAME),
+        usage_db_path: base_dir.join(USAGE_DB_FILE_NAME),
         base_dir,
         install_dir,
         binary_candidates,
@@ -4062,40 +4438,11 @@ fn create_default_config(paths: &ResolvedPaths) -> Value {
         "secret-key": DEFAULT_MANAGEMENT_API_KEY,
         "disable-control-panel": false,
       },
-      "payload": {
-        "default": [
-          build_managed_thinking_entry(SONNET_THINKING_MODELS, 8192),
-          build_managed_thinking_entry(OPUS_THINKING_MODELS, 8192),
-          build_managed_reasoning_effort_entry("xhigh"),
-        ]
-      },
       DESKTOP_METADATA_KEY: {
         "use-system-proxy": false,
         "manual-proxy-url": "",
         "proxy-username": "",
-        "proxy-password": "",
-        "thinking-budget": {
-          "mode": "medium",
-          "custom-budget": DEFAULT_THINKING_CUSTOM,
-        }
-      }
-    })
-}
-
-fn build_managed_thinking_entry(model_names: &[&str], token_budget: u32) -> Value {
-    json!({
-      "models": model_names.iter().map(|name| json!({ "name": name, "protocol": "claude" })).collect::<Vec<_>>(),
-      "params": {
-        "thinking.budget_tokens": token_budget
-      }
-    })
-}
-
-fn build_managed_reasoning_effort_entry(reasoning_effort: &str) -> Value {
-    json!({
-      "params": {
-        "reasoning.effort": reasoning_effort,
-        "_managedBy": MANAGED_REASONING_EFFORT_MARKER,
+        "proxy-password": ""
       }
     })
 }
@@ -4314,7 +4661,6 @@ fn extract_known_settings(config: &Value, gui_state: &GuiState) -> Value {
         .iter()
         .find_map(|item| normalized_string(Some(item)))
         .unwrap_or_else(|| DEFAULT_PROXY_API_KEY.to_string());
-    let (thinking_mode, thinking_custom) = extract_thinking_budget(config);
     json!({
       "port": port,
       "useSystemProxy": read_bool(desktop.get("use-system-proxy"), false),
@@ -4328,9 +4674,7 @@ fn extract_known_settings(config: &Value, gui_state: &GuiState) -> Value {
       "streamKeepaliveSeconds": clamp_non_negative_integer(read_number(streaming.get("keepalive-seconds"), DEFAULT_STREAM_KEEPALIVE_SECONDS as f64) as i64),
       "streamBootstrapRetries": clamp_non_negative_integer(read_number(streaming.get("bootstrap-retries"), DEFAULT_STREAM_BOOTSTRAP_RETRIES as f64) as i64),
       "nonStreamKeepaliveIntervalSeconds": clamp_non_negative_integer(read_number(config.get("nonstream-keepalive-interval"), DEFAULT_NON_STREAM_KEEPALIVE_INTERVAL_SECONDS as f64) as i64),
-      "thinkingBudgetMode": thinking_mode,
-      "thinkingBudgetCustom": thinking_custom,
-      "reasoningEffort": extract_reasoning_effort(config, gui_state),
+      "sidecarChannel": normalize_sidecar_channel(&gui_state.sidecar_channel),
       "autoSyncOnStop": gui_state.auto_sync_on_stop,
       "launchAtLogin": gui_state.launch_at_login,
       "autoStartProxyOnLaunch": gui_state.auto_start_proxy_on_launch,
@@ -4338,92 +4682,6 @@ fn extract_known_settings(config: &Value, gui_state: &GuiState) -> Value {
       "apiBaseUrl": build_api_base_url(port),
       "managementBaseUrl": build_management_base_url(port),
     })
-}
-
-fn extract_thinking_budget(config: &Value) -> (String, i64) {
-    let desktop = get_desktop_metadata(config);
-    let thinking_budget = object(desktop.get("thinking-budget"));
-    let fallback_mode = read_string(thinking_budget.get("mode"), "medium");
-    let fallback_custom = read_number(
-        thinking_budget.get("custom-budget"),
-        DEFAULT_THINKING_CUSTOM as f64,
-    ) as i64;
-    let payload = object(config.get("payload"));
-    let payload_defaults = array(payload.get("default"));
-    for entry in payload_defaults {
-        if is_managed_thinking_entry(&entry) {
-            let params = object(entry.get("params"));
-            let tokens = read_number(
-                params.get("thinking.budget_tokens"),
-                resolve_thinking_budget_tokens(&fallback_mode, fallback_custom) as f64,
-            ) as i64;
-            return (
-                thinking_mode_from_tokens(tokens, &fallback_mode),
-                if thinking_mode_from_tokens(tokens, &fallback_mode) == "custom" {
-                    tokens
-                } else {
-                    fallback_custom
-                },
-            );
-        }
-    }
-    (fallback_mode, fallback_custom)
-}
-
-fn resolve_thinking_budget_tokens(mode: &str, custom_budget: i64) -> i64 {
-    match mode {
-        "low" => 2048,
-        "medium" => 8192,
-        "high" => 32768,
-        _ => std::cmp::max(1024, custom_budget.max(DEFAULT_THINKING_CUSTOM as i64)),
-    }
-}
-
-fn thinking_mode_from_tokens(token_budget: i64, _fallback_mode: &str) -> String {
-    match token_budget {
-        2048 => "low".to_string(),
-        8192 => "medium".to_string(),
-        32768 => "high".to_string(),
-        _ => "custom".to_string(),
-    }
-}
-
-fn is_managed_thinking_entry(entry: &Value) -> bool {
-    let params = object(entry.get("params"));
-    if !params.contains_key("thinking.budget_tokens") {
-        return false;
-    }
-    let models = array(entry.get("models"));
-    let managed = SONNET_THINKING_MODELS
-        .iter()
-        .chain(OPUS_THINKING_MODELS.iter())
-        .copied()
-        .collect::<HashSet<_>>();
-    let names = models
-        .iter()
-        .filter_map(|model| normalized_string(model.get("name")))
-        .collect::<Vec<_>>();
-    !names.is_empty() && names.iter().all(|name| managed.contains(name.as_str()))
-}
-
-fn extract_reasoning_effort(config: &Value, gui_state: &GuiState) -> String {
-    let payload = object(config.get("payload"));
-    let defaults = array(payload.get("default"));
-    for entry in defaults {
-        let params = object(entry.get("params"));
-        if read_string(params.get("_managedBy"), "") == MANAGED_REASONING_EFFORT_MARKER {
-            let effort = read_string(params.get("reasoning.effort"), "");
-            if ["none", "minimal", "low", "medium", "high", "xhigh"].contains(&effort.as_str()) {
-                return effort;
-            }
-        }
-    }
-    let fallback = gui_state.reasoning_effort.to_lowercase();
-    if ["none", "minimal", "low", "medium", "high", "xhigh"].contains(&fallback.as_str()) {
-        fallback
-    } else {
-        "xhigh".to_string()
-    }
 }
 
 fn apply_known_settings(backend: &Backend, config: &mut Value, input: &Value) -> Result<()> {
@@ -4532,67 +4790,55 @@ fn apply_known_settings(backend: &Backend, config: &mut Value, input: &Value) ->
         ) as i64))),
     );
 
-    apply_thinking_budget(
-        config,
-        &read_string(input.get("thinkingBudgetMode"), "medium"),
-        read_number(
-            input.get("thinkingBudgetCustom"),
-            DEFAULT_THINKING_CUSTOM as f64,
-        ) as i64,
-    );
-    apply_reasoning_effort(config, &read_string(input.get("reasoningEffort"), "xhigh"));
+    strip_managed_reasoning_effort_entries(config);
     Ok(())
 }
 
-fn apply_thinking_budget(config: &mut Value, mode: &str, custom_budget: i64) {
-    let token_budget = resolve_thinking_budget_tokens(mode, custom_budget);
+fn strip_managed_reasoning_effort_entries(config: &mut Value) -> bool {
     let payload = ensure_object_mut(root_object_mut(config).unwrap(), "payload");
-    let defaults = array(payload.get("default"))
-        .into_iter()
-        .filter(|entry| !is_managed_thinking_entry(entry))
-        .collect::<Vec<_>>();
-    payload.insert(
-        "default".to_string(),
-        Value::Array(
-            vec![
-                build_managed_thinking_entry(SONNET_THINKING_MODELS, token_budget as u32),
-                build_managed_thinking_entry(OPUS_THINKING_MODELS, token_budget as u32),
-            ]
-            .into_iter()
-            .chain(defaults)
-            .collect(),
-        ),
-    );
-    let desktop = ensure_object_mut(root_object_mut(config).unwrap(), DESKTOP_METADATA_KEY);
-    desktop.insert(
-        "thinking-budget".to_string(),
-        json!({
-          "mode": mode,
-          "custom-budget": std::cmp::max(1024, custom_budget.max(DEFAULT_THINKING_CUSTOM as i64)),
-        }),
-    );
+    let mut changed = false;
+    for key in ["default", "override"] {
+        let original = array(payload.get(key));
+        let filtered = original
+            .iter()
+            .filter(|entry| {
+                let params = object(entry.get("params"));
+                read_string(params.get("_managedBy"), "")
+                    != "x-cliproxy-desktop-reasoning-effort"
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if filtered.len() != original.len() {
+            payload.insert(key.to_string(), Value::Array(filtered));
+            changed = true;
+        }
+    }
+    changed
 }
 
-fn apply_reasoning_effort(config: &mut Value, reasoning_effort: &str) {
-    let payload = ensure_object_mut(root_object_mut(config).unwrap(), "payload");
-    let defaults = array(payload.get("default"))
-        .into_iter()
+fn strip_managed_thinking_entries(config: &mut Value) -> bool {
+    let mut changed = false;
+    let root = root_object_mut(config).unwrap();
+    if let Some(desktop) = root.get_mut(DESKTOP_METADATA_KEY).and_then(Value::as_object_mut) {
+        if desktop.remove("thinking-budget").is_some() {
+            changed = true;
+        }
+    }
+    let payload = ensure_object_mut(root, "payload");
+    let original = array(payload.get("default"));
+    let filtered = original
+        .iter()
         .filter(|entry| {
             let params = object(entry.get("params"));
-            read_string(params.get("_managedBy"), "") != MANAGED_REASONING_EFFORT_MARKER
+            !params.contains_key("thinking.budget_tokens")
         })
+        .cloned()
         .collect::<Vec<_>>();
-    let normalized = reasoning_effort.trim().to_lowercase();
-    payload.insert(
-        "default".to_string(),
-        Value::Array(if normalized == "none" {
-            defaults
-        } else {
-            std::iter::once(build_managed_reasoning_effort_entry(&normalized))
-                .chain(defaults)
-                .collect()
-        }),
-    );
+    if filtered.len() != original.len() {
+        payload.insert("default".to_string(), Value::Array(filtered));
+        changed = true;
+    }
+    changed
 }
 
 fn read_providers(config: &Value) -> Value {
@@ -5724,6 +5970,7 @@ fn is_usage_log_file_name(file_name: &str) -> bool {
     file_name.starts_with("v1-responses-")
         || file_name.starts_with("v1-chat-completions-")
         || file_name.starts_with("v1-completions-")
+        || file_name.starts_with("v1-models-")
 }
 
 fn build_usage_log_file_id(file_name: &str, size: u64, mtime_ms: u64) -> String {
@@ -5888,13 +6135,18 @@ fn extract_usage_log_section<'a>(
     Some(raw[content_start..end_index.unwrap_or(raw.len())].trim())
 }
 
-fn fetch_release_asset_descriptor(tag: &str) -> Result<ReleaseAssetDescriptor> {
+fn fetch_release_asset_descriptor_for_channel(
+    tag: &str,
+    channel: &str,
+) -> Result<ReleaseAssetDescriptor> {
     let normalized_tag = if tag.starts_with('v') {
         tag.to_string()
     } else {
         format!("v{tag}")
     };
     let version = normalized_tag.trim_start_matches('v').to_string();
+    let asset_prefix = sidecar_asset_prefix(channel);
+    let repository = sidecar_repository(channel);
     let arch = std::env::consts::ARCH;
     let target = if cfg!(target_os = "windows") {
         match arch {
@@ -5912,7 +6164,7 @@ fn fetch_release_asset_descriptor(tag: &str) -> Result<ReleaseAssetDescriptor> {
         return Err(anyhow!("当前平台暂不支持自动更新。"));
     };
     if cfg!(target_os = "windows") {
-        let asset_name = format!("CLIProxyAPI_{version}_windows_{target}.zip");
+        let asset_name = format!("{asset_prefix}_{version}_windows_{target}.zip");
         Ok(ReleaseAssetDescriptor {
             tag: normalized_tag.clone(),
             version,
@@ -5924,11 +6176,11 @@ fn fetch_release_asset_descriptor(tag: &str) -> Result<ReleaseAssetDescriptor> {
                 .map(str::to_string)
                 .collect(),
             download_url: format!(
-        "https://github.com/{CLIPROXY_REPOSITORY}/releases/download/{normalized_tag}/{asset_name}"
-      ),
+                "https://github.com/{repository}/releases/download/{normalized_tag}/{asset_name}"
+            ),
         })
     } else {
-        let asset_name = format!("CLIProxyAPI_{version}_darwin_{target}.tar.gz");
+        let asset_name = format!("{asset_prefix}_{version}_darwin_{target}.tar.gz");
         Ok(ReleaseAssetDescriptor {
             tag: normalized_tag.clone(),
             version,
@@ -5940,15 +6192,18 @@ fn fetch_release_asset_descriptor(tag: &str) -> Result<ReleaseAssetDescriptor> {
                 .map(str::to_string)
                 .collect(),
             download_url: format!(
-        "https://github.com/{CLIPROXY_REPOSITORY}/releases/download/{normalized_tag}/{asset_name}"
-      ),
+                "https://github.com/{repository}/releases/download/{normalized_tag}/{asset_name}"
+            ),
         })
     }
 }
 
-async fn fetch_latest_release_descriptor(client: &Client) -> Result<ReleaseAssetDescriptor> {
+async fn fetch_latest_release_descriptor(
+    client: &Client,
+    channel: &str,
+) -> Result<ReleaseAssetDescriptor> {
     let response = client
-        .get(CLIPROXY_RELEASES_LATEST_API_URL)
+        .get(sidecar_releases_latest_api_url(channel))
         .header("accept", "application/vnd.github+json")
         .send()
         .await?;
@@ -5959,7 +6214,7 @@ async fn fetch_latest_release_descriptor(client: &Client) -> Result<ReleaseAsset
                 .or_else(|| normalized_string(payload.get("name")))
                 .or_else(|| normalized_string(payload.get("tag")))
                 .ok_or_else(|| anyhow!("缺少 tag_name"))?;
-            let mut descriptor = fetch_release_asset_descriptor(&tag)?;
+            let mut descriptor = fetch_release_asset_descriptor_for_channel(&tag, channel)?;
             if let Some(assets) = payload.get("assets").and_then(Value::as_array) {
                 for asset in assets {
                     let name = normalized_string(asset.get("name"));
@@ -5982,11 +6237,14 @@ async fn fetch_latest_release_descriptor(client: &Client) -> Result<ReleaseAsset
         // Fall through to redirect-based latest release resolution.
     }
 
-    let response = client.get(CLIPROXY_RELEASES_LATEST_URL).send().await?;
+    let response = client
+        .get(sidecar_releases_latest_url(channel))
+        .send()
+        .await?;
     let url = response.url().as_str().to_string();
     let tag = regex_capture(&url, r"/releases/tag/([^/?#]+)")
-        .ok_or_else(|| anyhow!("无法解析 CLIProxyAPI 最新发布版本。"))?;
-    fetch_release_asset_descriptor(&tag)
+        .ok_or_else(|| anyhow!("无法解析 {} 最新发布版本。", sidecar_display_name(channel)))?;
+    fetch_release_asset_descriptor_for_channel(&tag, channel)
 }
 
 fn desktop_app_asset_suffixes() -> Result<Vec<&'static str>> {
@@ -7104,21 +7362,62 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_none_removes_managed_entry() {
+    fn strip_managed_reasoning_effort_entries_removes_legacy_entries() {
         let mut config = json!({
             "payload": {
                 "default": [
-                    build_managed_reasoning_effort_entry("xhigh"),
-                    json!({"params": {"temperature": 0.2}})
+                    json!({"params": {"temperature": 0.2}}),
+                    json!({"params": {"_managedBy": "x-cliproxy-desktop-reasoning-effort", "reasoning.effort": "high"}})
+                ],
+                "override": [
+                    json!({"params": {"_managedBy": "x-cliproxy-desktop-reasoning-effort", "reasoning_effort": "medium"}}),
+                    json!({"params": {"stream": true}})
                 ]
             }
         });
-        apply_reasoning_effort(&mut config, "none");
+        assert!(strip_managed_reasoning_effort_entries(&mut config));
         let payload = object(config.get("payload"));
-        let defaults = array(payload.get("default"));
-        assert_eq!(defaults.len(), 1);
-        let params = object(defaults[0].get("params"));
-        assert_eq!(read_string(params.get("_managedBy"), ""), "");
+        assert_eq!(array(payload.get("default")).len(), 1);
+        assert_eq!(array(payload.get("override")).len(), 1);
+    }
+
+    #[test]
+    fn parse_version_segments_ignores_trailing_labels() {
+        assert_eq!(
+            parse_version_segments("6.9.23-0-plus"),
+            Some(vec![6, 9, 23, 0])
+        );
+        assert_eq!(parse_version_segments("v6.9.23-0"), Some(vec![6, 9, 23, 0]));
+        assert_eq!(parse_version_segments("0.1.0"), Some(vec![0, 1, 0]));
+    }
+
+    #[test]
+    fn compare_versions_handles_plus_suffix_output() {
+        assert_eq!(compare_versions("6.9.23-0", "6.9.23-0-plus"), Some(0));
+        assert_eq!(compare_versions("6.9.24-0", "6.9.23-0-plus"), Some(1));
+        assert_eq!(compare_versions("6.9.22-0", "6.9.23-0-plus"), Some(-1));
+    }
+
+    #[test]
+    fn binary_update_available_when_selected_channel_differs() {
+        assert_eq!(
+            compute_proxy_binary_update_available(
+                true,
+                Some("6.9.26".to_string()),
+                Some("6.9.23-0".to_string()),
+                "plus",
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            compute_proxy_binary_update_available(
+                true,
+                Some("6.9.23-0-plus".to_string()),
+                Some("6.9.26".to_string()),
+                "main",
+            ),
+            Some(true)
+        );
     }
 }
 
@@ -7504,12 +7803,18 @@ fn compute_proxy_binary_update_available(
     has_binary: bool,
     current_version: Option<String>,
     latest_version: Option<String>,
+    selected_channel: &str,
 ) -> Option<bool> {
     let latest_version = latest_version?;
+    let selected_channel = normalize_sidecar_channel(selected_channel);
     if !has_binary {
         return Some(true);
     }
     let current_version = current_version?;
+    let current_channel = detect_sidecar_channel_from_version(Some(&current_version));
+    if current_channel != selected_channel {
+        return Some(true);
+    }
     compare_versions(&latest_version, &current_version).map(|value| value > 0)
 }
 
@@ -7540,8 +7845,18 @@ fn parse_version_segments(version: &str) -> Option<Vec<i64>> {
         if segment.is_empty() {
             continue;
         }
-        let value = segment.parse::<i64>().ok()?;
+        let numeric_prefix = segment
+            .chars()
+            .take_while(|value| value.is_ascii_digit())
+            .collect::<String>();
+        if numeric_prefix.is_empty() {
+            break;
+        }
+        let value = numeric_prefix.parse::<i64>().ok()?;
         segments.push(value);
+        if numeric_prefix.len() != segment.len() {
+            break;
+        }
     }
     (!segments.is_empty()).then_some(segments)
 }

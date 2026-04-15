@@ -6,7 +6,13 @@ import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
-const REPOSITORY = 'router-for-me/CLIProxyAPI'
+function normalizeChannel(value) {
+  return String(value || 'main').trim().toLowerCase() === 'plus' ? 'plus' : 'main'
+}
+
+const CHANNEL = normalizeChannel(process.env.CLIPROXYAPI_CHANNEL)
+const REPOSITORY = CHANNEL === 'plus' ? 'router-for-me/CLIProxyAPIPlus' : 'router-for-me/CLIProxyAPI'
+const ASSET_PREFIX = CHANNEL === 'plus' ? 'CLIProxyAPIPlus' : 'CLIProxyAPI'
 const LATEST_RELEASE_API_URL = `https://api.github.com/repos/${REPOSITORY}/releases/latest`
 const LATEST_RELEASE_URL = `https://github.com/${REPOSITORY}/releases/latest`
 const RESOURCE_BIN_DIR = path.resolve(process.cwd(), 'src-tauri/resources/bin')
@@ -131,10 +137,10 @@ function normalizeTag(tag) {
 
 function buildAssetName(target, version) {
   if (target.platform === 'windows') {
-    return `CLIProxyAPI_${version}_windows_${target.assetSuffix}.zip`
+    return `${ASSET_PREFIX}_${version}_windows_${target.assetSuffix}.zip`
   }
 
-  return `CLIProxyAPI_${version}_darwin_${target.assetSuffix}.tar.gz`
+  return `${ASSET_PREFIX}_${version}_darwin_${target.assetSuffix}.tar.gz`
 }
 
 function buildReleaseDescriptor(targetTriple, tag) {
