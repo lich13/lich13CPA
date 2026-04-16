@@ -952,6 +952,7 @@ function createDashboardQuotaPlaceholder(id: string, label: string): AuthFileQuo
     label,
     remainingPercent: null,
     amountText: null,
+    resetAt: null,
     resetText: null,
   }
 }
@@ -977,6 +978,56 @@ function getQuotaUsedPercent(item: AuthFileQuotaItem): number | null {
   }
 
   return Math.max(0, Math.min(100, 100 - item.remainingPercent))
+}
+
+function formatQuotaResetTime(value: number): string {
+  const date = new Date(value)
+  const month = `${date.getMonth() + 1}`.padStart(2, '0')
+  const day = `${date.getDate()}`.padStart(2, '0')
+  const hour = `${date.getHours()}`.padStart(2, '0')
+  const minute = `${date.getMinutes()}`.padStart(2, '0')
+  return `${month}/${day} ${hour}:${minute}`
+}
+
+function formatQuotaResetCountdown(resetAtMs: number, nowMs: number): string {
+  const diffMs = resetAtMs - nowMs
+
+  if (diffMs <= 0) {
+    return '即将重置'
+  }
+
+  const totalMinutes = Math.max(1, Math.ceil(diffMs / 60000))
+  const days = Math.floor(totalMinutes / (24 * 60))
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60)
+  const minutes = totalMinutes % 60
+  const parts: string[] = []
+
+  if (days > 0) {
+    parts.push(`${days}天`)
+  }
+  if (hours > 0) {
+    parts.push(`${hours}小时`)
+  }
+  if (minutes > 0 && parts.length < 2) {
+    parts.push(`${minutes}分钟`)
+  }
+  if (parts.length === 0) {
+    parts.push('不到1分钟')
+  }
+
+  return `还剩 ${parts.join('')}`
+}
+
+function formatQuotaResetDisplay(item: AuthFileQuotaItem, nowMs: number): string {
+  if (item.resetAt) {
+    const resetAtMs = new Date(item.resetAt).getTime()
+
+    if (!Number.isNaN(resetAtMs)) {
+      return `本地 ${formatQuotaResetTime(resetAtMs)} · ${formatQuotaResetCountdown(resetAtMs, nowMs)}`
+    }
+  }
+
+  return item.resetText ?? '暂无重置时间'
 }
 
 function getDashboardQuotaItems(summary: AuthFileQuotaSummary): AuthFileQuotaItem[] {
@@ -1435,6 +1486,7 @@ function App() {
   const [notice, setNotice] = useState<Notice | null>(null)
   const [providerEditor, setProviderEditor] = useState<ProviderEditorState | null>(null)
   const [quotaStateByFile, setQuotaStateByFile] = useState<Record<string, QuotaState>>({})
+  const [quotaClockMs, setQuotaClockMs] = useState(() => Date.now())
   const [usageCustomRangeDraft, setUsageCustomRangeDraft] = useState<UsageCustomRangeDraft>(() =>
     createDefaultUsageCustomRange(),
   )
@@ -1464,6 +1516,20 @@ function App() {
   const refreshUsageSummary = useEffectEvent((query: UsageSummaryQuery) => {
     void fetchUsageSummaryForRange(query)
   })
+  const refreshQuotaClock = useEffectEvent(() => {
+    setQuotaClockMs(Date.now())
+  })
+
+  useEffect(() => {
+    refreshQuotaClock()
+    const timerId = window.setInterval(() => {
+      refreshQuotaClock()
+    }, 30000)
+
+    return () => {
+      window.clearInterval(timerId)
+    }
+  }, [refreshQuotaClock])
 
   function applyAppState(nextState: DesktopAppState) {
     startTransition(() => {
@@ -2556,7 +2622,7 @@ async function loadState() {
                                     />
                                   </div>
                                   <div className="quota-progress-meta">
-                                    <span>{item.resetText ?? '等待下一次同步'}</span>
+                                    <span>{formatQuotaResetDisplay(item, quotaClockMs)}</span>
                                     {item.amountText && item.amountText !== item.resetText ? (
                                       <span>{item.amountText}</span>
                                     ) : null}
@@ -3924,7 +3990,7 @@ async function loadState() {
                   </div>
                   <div className="auth-quota-meta">
                     <span>{item.amountText ?? '暂无额度数值'}</span>
-                    <span>{item.resetText ?? '暂无重置时间'}</span>
+                    <span>{formatQuotaResetDisplay(item, quotaClockMs)}</span>
                   </div>
                 </article>
               )

@@ -241,6 +241,7 @@ export interface AuthFileQuotaItem {
   label: string
   remainingPercent: number | null
   amountText: string | null
+  resetAt: string | null
   resetText: string | null
 }
 

@@ -2,7 +2,7 @@
   "name": "lich13cpa",
   "productName": "lich13CPA",
   "private": true,
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Tauri desktop shell for CLIProxyAPI with local config, auth, and bundled binary flow.",
   "type": "module",
   "engines": {

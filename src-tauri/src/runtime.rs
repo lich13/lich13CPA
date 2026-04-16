@@ -18,7 +18,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
-use chrono::{TimeZone, Utc};
+use chrono::{Local, TimeZone, Utc};
 use env_proxy;
 use flate2::read::GzDecoder;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -6736,7 +6736,8 @@ fn build_codex_quota_summary(record: &Value, payload: &Value) -> Value {
                         .or_else(|| section.get("limitReached")),
                     section.get("allowed"),
                 ),
-                format_codex_reset_label(window),
+                codex_reset_at(window),
+                None,
                 quota_amount_text(window),
             ));
         }
@@ -6751,7 +6752,8 @@ fn build_codex_quota_summary(record: &Value, payload: &Value) -> Value {
                         .or_else(|| section.get("limitReached")),
                     section.get("allowed"),
                 ),
-                format_codex_reset_label(window),
+                codex_reset_at(window),
+                None,
                 quota_amount_text(window),
             ));
         }
@@ -6795,7 +6797,8 @@ fn build_codex_quota_summary(record: &Value, payload: &Value) -> Value {
                         .or_else(|| section.get("limitReached")),
                     section.get("allowed"),
                 ),
-                format_codex_reset_label(window),
+                codex_reset_at(window),
+                None,
                 quota_amount_text(window),
             ));
         }
@@ -6810,7 +6813,8 @@ fn build_codex_quota_summary(record: &Value, payload: &Value) -> Value {
                         .or_else(|| section.get("limitReached")),
                     section.get("allowed"),
                 ),
-                format_codex_reset_label(window),
+                codex_reset_at(window),
+                None,
                 quota_amount_text(window),
             ));
         }
@@ -6839,11 +6843,14 @@ fn build_claude_quota_summary(
         if section.is_empty() || !section.contains_key("utilization") {
             continue;
         }
+        let (reset_at, reset_text) =
+            quota_reset_info_from_value(section.get("resets_at").or_else(|| section.get("resetsAt")));
         items.push(build_quota_item(
             id,
             label,
             to_remaining_percent_from_used(section.get("utilization")),
-            format_quota_reset_time(section.get("resets_at").or_else(|| section.get("resetsAt"))),
+            reset_at,
+            reset_text,
             None,
         ));
     }
@@ -6898,11 +6905,13 @@ fn build_gemini_quota_summary(
         .into_iter()
         .map(
             |(model, (remaining_fraction, reset_time, remaining_amount))| {
+                let (reset_at, reset_text) = quota_reset_info_from_string(reset_time);
                 build_quota_item(
                     &model,
                     &model,
                     normalize_percent_value(remaining_fraction),
-                    format_quota_reset_time_value(reset_time),
+                    reset_at,
+                    reset_text,
                     remaining_amount.map(|amount| format!("{amount} 次")),
                 )
             },
@@ -6931,15 +6940,17 @@ fn build_antigravity_quota_summary(record: &Value, payload: &Value, project_id: 
         }
         let display_name =
             normalized_string(entry.get("displayName")).unwrap_or_else(|| model_id.clone());
+        let (reset_at, reset_text) = quota_reset_info_from_value(
+            quota_info
+                .get("resetTime")
+                .or_else(|| quota_info.get("reset_time")),
+        );
         items.push(build_quota_item(
             &model_id,
             &display_name,
             normalize_percent_value(remaining_fraction),
-            format_quota_reset_time(
-                quota_info
-                    .get("resetTime")
-                    .or_else(|| quota_info.get("reset_time")),
-            ),
+            reset_at,
+            reset_text,
             None,
         ));
     }
@@ -6990,11 +7001,13 @@ fn build_kimi_quota_item(id: &str, label: &str, data: &Value) -> Option<Value> {
         (Some(_), Some(_)) => Some(0.0),
         _ => None,
     };
+    let (reset_at, reset_text) = kimi_reset_info(data);
     Some(build_quota_item(
         id,
         label,
         remaining_percent,
-        format_kimi_reset_hint(data),
+        reset_at,
+        reset_text,
         match (used, limit) {
             (Some(used), Some(limit)) => Some(format!(
                 "{} / {}",
@@ -7010,6 +7023,7 @@ fn build_quota_item(
     id: &str,
     label: &str,
     remaining_percent: Option<f64>,
+    reset_at: Option<String>,
     reset_text: Option<String>,
     amount_text: Option<String>,
 ) -> Value {
@@ -7018,6 +7032,7 @@ fn build_quota_item(
       "label": label,
       "remainingPercent": remaining_percent.map(|value| value.round() as i64),
       "amountText": amount_text,
+      "resetAt": reset_at,
       "resetText": reset_text,
     })
 }
@@ -7186,68 +7201,123 @@ fn normalize_percent_like(value: Option<&Value>) -> Option<f64> {
     Some(value.clamp(0.0, 100.0))
 }
 
-fn format_codex_reset_label(window: &Map<String, Value>) -> Option<String> {
+fn codex_reset_at(window: &Map<String, Value>) -> Option<String> {
     if let Some(reset_at) =
         normalized_number(window.get("reset_at").or_else(|| window.get("resetAt")))
     {
-        return format_unix_seconds_label(reset_at as i64);
+        return quota_reset_at_from_unix_seconds(reset_at as i64);
     }
     if let Some(reset_after_seconds) = normalized_number(
         window
             .get("reset_after_seconds")
             .or_else(|| window.get("resetAfterSeconds")),
     ) {
-        return format_unix_seconds_label(Utc::now().timestamp() + reset_after_seconds as i64);
+        return quota_reset_at_after_seconds(reset_after_seconds as i64);
     }
     None
 }
 
-fn format_unix_seconds_label(value: i64) -> Option<String> {
+fn quota_reset_at_from_unix_seconds(value: i64) -> Option<String> {
     if value <= 0 {
         return None;
     }
-    Some(
-        Utc.timestamp_opt(value, 0)
-            .single()?
-            .format("%m/%d %H:%M")
-            .to_string(),
-    )
+    Some(Utc.timestamp_opt(value, 0).single()?.to_rfc3339())
 }
 
-fn format_quota_reset_time(value: Option<&Value>) -> Option<String> {
-    format_quota_reset_time_value(normalized_string(value))
+fn quota_reset_at_after_seconds(value: i64) -> Option<String> {
+    if value <= 0 {
+        return None;
+    }
+    Some((Utc::now() + chrono::Duration::seconds(value)).to_rfc3339())
 }
 
-fn format_quota_reset_time_value(value: Option<String>) -> Option<String> {
-    let value = value?;
-    let parsed = chrono::DateTime::parse_from_rfc3339(&value).ok()?;
-    Some(parsed.with_timezone(&Utc).format("%m/%d %H:%M").to_string())
+fn parse_quota_reset_timestamp(value: &str) -> Option<chrono::DateTime<Utc>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Some(parsed.with_timezone(&Utc));
+    }
+
+    if trimmed.chars().all(|char| char.is_ascii_digit()) {
+        if trimmed.len() >= 13 {
+            let millis = trimmed.parse::<i64>().ok()?;
+            return Utc.timestamp_millis_opt(millis).single();
+        }
+        let seconds = trimmed.parse::<i64>().ok()?;
+        return Utc.timestamp_opt(seconds, 0).single();
+    }
+
+    let naive = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S").ok()?;
+    Local
+        .from_local_datetime(&naive)
+        .single()
+        .map(|parsed| parsed.with_timezone(&Utc))
 }
 
-fn format_kimi_reset_hint(data: &Value) -> Option<String> {
+fn quota_reset_info_from_value(value: Option<&Value>) -> (Option<String>, Option<String>) {
+    quota_reset_info_from_string(normalized_string(value))
+}
+
+fn quota_reset_info_from_string(value: Option<String>) -> (Option<String>, Option<String>) {
+    let Some(value) = value else {
+        return (None, None);
+    };
+    let reset_at = parse_quota_reset_timestamp(&value).map(|parsed| parsed.to_rfc3339());
+    let reset_text = if reset_at.is_some() {
+        None
+    } else {
+        Some(value)
+    };
+    (reset_at, reset_text)
+}
+
+fn format_relative_reset_hint(seconds: i64) -> Option<String> {
+    if seconds <= 0 {
+        return Some("即将重置".to_string());
+    }
+
+    let total_minutes = ((seconds + 59) / 60).max(1);
+    let days = total_minutes / (24 * 60);
+    let hours = (total_minutes % (24 * 60)) / 60;
+    let minutes = total_minutes % 60;
+    let mut parts = Vec::new();
+
+    if days > 0 {
+        parts.push(format!("{days}天"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}小时"));
+    }
+    if minutes > 0 && parts.len() < 2 {
+        parts.push(format!("{minutes}分钟"));
+    }
+    if parts.is_empty() {
+        parts.push("不到1分钟".to_string());
+    }
+
+    Some(format!("还剩 {}", parts.join("")))
+}
+
+fn kimi_reset_info(data: &Value) -> (Option<String>, Option<String>) {
     for key in ["reset_at", "resetAt", "reset_time", "resetTime"] {
-        if let Some(value) = format_quota_reset_time(data.get(key)) {
-            return Some(value);
+        let (reset_at, reset_text) = quota_reset_info_from_value(data.get(key));
+        if reset_at.is_some() || reset_text.is_some() {
+            return (reset_at, reset_text);
         }
     }
     let relative = normalized_number(
         data.get("reset_in")
             .or_else(|| data.get("resetIn"))
             .or_else(|| data.get("ttl")),
-    )?;
-    let seconds = relative as i64;
-    let hours = seconds / 3600;
-    let minutes = (seconds % 3600) / 60;
-    if hours > 0 && minutes > 0 {
-        return Some(format!("{hours}h {minutes}m"));
-    }
-    if hours > 0 {
-        return Some(format!("{hours}h"));
-    }
-    if minutes > 0 {
-        return Some(format!("{minutes}m"));
-    }
-    Some("<1m".to_string())
+    );
+    let seconds = relative.map(|value| value as i64).unwrap_or_default();
+    (
+        quota_reset_at_after_seconds(seconds),
+        format_relative_reset_hint(seconds),
+    )
 }
 
 fn resolve_claude_plan_type_from_profile(profile: &Value) -> Option<String> {
@@ -7635,6 +7705,23 @@ mod tests {
         assert_eq!(compare_versions("6.9.23-0", "6.9.23-0-plus"), Some(0));
         assert_eq!(compare_versions("6.9.24-0", "6.9.23-0-plus"), Some(1));
         assert_eq!(compare_versions("6.9.22-0", "6.9.23-0-plus"), Some(-1));
+    }
+
+    #[test]
+    fn quota_reset_info_from_string_normalizes_timezone() {
+        let (reset_at, reset_text) =
+            quota_reset_info_from_string(Some("2026-04-17T08:00:00+08:00".to_string()));
+
+        assert_eq!(reset_text, None);
+        assert_eq!(reset_at.as_deref(), Some("2026-04-17T00:00:00+00:00"));
+    }
+
+    #[test]
+    fn kimi_reset_info_converts_relative_seconds_to_absolute_reset_at() {
+        let (reset_at, reset_text) = kimi_reset_info(&json!({ "reset_in": 5400 }));
+
+        assert!(reset_at.is_some());
+        assert_eq!(reset_text.as_deref(), Some("还剩 1小时30分钟"));
     }
 
     #[test]
