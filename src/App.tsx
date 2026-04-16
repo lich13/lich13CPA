@@ -2452,7 +2452,7 @@ async function loadState() {
                   void runStateAction(
                     'update-app',
                     () => window.cliproxy.updateApp(),
-                    '已下载并打开最新安装包',
+                    '已开始软件更新',
                   )
                 }
                 type="button"

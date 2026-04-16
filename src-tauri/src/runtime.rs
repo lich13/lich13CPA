@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::{
@@ -75,6 +77,8 @@ const SIDECAR_CHANNEL_PLUS: &str = "plus";
 const DESKTOP_APP_RELEASES_LATEST_URL: &str = "https://github.com/lich13/lich13CPA/releases/latest";
 const DESKTOP_APP_RELEASES_LATEST_API_URL: &str =
     "https://api.github.com/repos/lich13/lich13CPA/releases/latest";
+const DESKTOP_APP_RELEASES_EXPANDED_ASSETS_URL_PREFIX: &str =
+    "https://github.com/lich13/lich13CPA/releases/expanded_assets";
 const DEFAULT_PROXY_CHECK_URL: &str = "https://example.com";
 const MAIN_WINDOW_LABEL: &str = "main";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -464,7 +468,10 @@ impl Backend {
                 continue;
             }
             let path = entry.path();
-            let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
             if keep_asset_name.is_some_and(|keep| keep == name) {
                 continue;
             }
@@ -542,7 +549,8 @@ impl Backend {
                     .unwrap()
                     .latest_asset_name
                     .clone();
-                if let Err(error) = backend.cleanup_update_installers(latest_asset_name.as_deref()) {
+                if let Err(error) = backend.cleanup_update_installers(latest_asset_name.as_deref())
+                {
                     backend.append_log("warn", "app", &format!("清理旧安装包失败：{error}"));
                 }
             }
@@ -596,9 +604,7 @@ impl Backend {
         if state.width > 0 && state.height > 0 {
             let _ = window.set_size(Size::Physical(PhysicalSize::new(state.width, state.height)));
         }
-        let _ = window.set_position(Position::Physical(PhysicalPosition::new(
-            state.x, state.y,
-        )));
+        let _ = window.set_position(Position::Physical(PhysicalPosition::new(state.x, state.y)));
         if state.fullscreen {
             let _ = window.set_fullscreen(true);
         } else if state.maximized {
@@ -1063,7 +1069,10 @@ impl Backend {
     pub async fn update_app(&self) -> Result<Value> {
         self.install_app_update().await?;
         self.emit_state_changed();
-        self.build_app_state(None).await
+        let state = self.build_app_state(None).await?;
+        #[cfg(target_os = "macos")]
+        self.schedule_app_restart_for_update();
+        Ok(state)
     }
 
     pub async fn pick_auth_files(&self, provider_hint: Option<String>) -> Result<Value> {
@@ -3567,7 +3576,8 @@ impl Backend {
     async fn refresh_app_update_state(&self) -> Result<()> {
         let current_version = self.current_app_version();
         let descriptor = fetch_latest_app_release_descriptor(&self.inner.client).await?;
-        self.cleanup_update_installers(Some(&descriptor.asset_name)).ok();
+        self.cleanup_update_installers(Some(&descriptor.asset_name))
+            .ok();
         let mut app_update = self.inner.app_update.lock().unwrap();
         app_update.current_version = current_version.clone();
         app_update.latest_tag = Some(descriptor.tag.clone());
@@ -3592,7 +3602,8 @@ impl Backend {
 
         let updates_dir = self.inner.paths.base_dir.join("updates");
         fs::create_dir_all(&updates_dir)?;
-        self.cleanup_update_installers(Some(&descriptor.asset_name)).ok();
+        self.cleanup_update_installers(Some(&descriptor.asset_name))
+            .ok();
         let installer_path = updates_dir.join(&descriptor.asset_name);
 
         self.append_log(
@@ -3645,6 +3656,20 @@ impl Backend {
             }
         }
 
+        #[cfg(target_os = "macos")]
+        {
+            self.schedule_macos_silent_app_update(&installer_path, &descriptor)?;
+            self.append_log(
+                "info",
+                "app",
+                &format!(
+                    "已安排桌面应用静默更新，应用即将自动重启：{}",
+                    installer_path.to_string_lossy()
+                ),
+            );
+        }
+
+        #[cfg(not(target_os = "macos"))]
         self.open_path(installer_path.to_string_lossy().to_string())?;
 
         {
@@ -3659,16 +3684,105 @@ impl Backend {
             app_update.update_available = Some(true);
         }
 
+        #[cfg(target_os = "macos")]
+        let completion_message = format!(
+            "桌面应用更新安装器已就绪：{}",
+            installer_path.to_string_lossy()
+        );
+        #[cfg(not(target_os = "macos"))]
+        let completion_message = format!(
+            "已打开桌面应用更新安装包：{}",
+            installer_path.to_string_lossy()
+        );
+
+        self.append_log("info", "app", &completion_message);
+
+        Ok(installer_path)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn current_app_bundle_path(&self) -> Result<PathBuf> {
+        let current_executable = std::env::current_exe()
+            .context("failed to resolve current executable for desktop app update")?;
+        current_executable
+            .ancestors()
+            .find(|path| {
+                path.extension()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.eq_ignore_ascii_case("app"))
+                    .unwrap_or(false)
+            })
+            .map(Path::to_path_buf)
+            .ok_or_else(|| anyhow!("当前不是从 macOS .app 包内运行，无法执行静默更新。"))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn schedule_macos_silent_app_update(
+        &self,
+        installer_path: &Path,
+        descriptor: &AppReleaseAssetDescriptor,
+    ) -> Result<()> {
+        let target_app = self.current_app_bundle_path()?;
+        let updates_dir = installer_path
+            .parent()
+            .ok_or_else(|| anyhow!("无法确定桌面应用更新目录。"))?;
+        let target_parent = target_app
+            .parent()
+            .ok_or_else(|| anyhow!("无法确定当前 macOS 应用安装目录。"))?;
+        let app_name = target_app
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("lich13CPA");
+        let stamp = Utc::now().timestamp_millis();
+        let script_path = updates_dir.join(format!("desktop-app-update-{stamp}.sh"));
+        let log_path = updates_dir.join(format!("desktop-app-update-{stamp}.log"));
+        let mount_dir = updates_dir.join(format!("desktop-app-update-mount-{stamp}"));
+        let staging_app = target_parent.join(format!(".{app_name}.update-staging.app"));
+        let backup_app = target_parent.join(format!(".{app_name}.backup.app"));
+
+        fs::write(&script_path, macos_silent_update_script())?;
+        let mut permissions = fs::metadata(&script_path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions)?;
+
+        let mut command = Command::new("/bin/bash");
+        command
+            .arg(&script_path)
+            .arg(installer_path)
+            .arg(&target_app)
+            .arg(&descriptor.version)
+            .arg(std::process::id().to_string())
+            .arg(&log_path)
+            .arg(&mount_dir)
+            .arg(&staging_app)
+            .arg(&backup_app)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+            .spawn()
+            .with_context(|| "failed to launch macOS silent desktop app updater")?;
+
         self.append_log(
             "info",
             "app",
-            &format!(
-                "已打开桌面应用更新安装包：{}",
-                installer_path.to_string_lossy()
-            ),
+            &format!("已启动静默更新安装器，日志：{}", log_path.to_string_lossy()),
         );
 
-        Ok(installer_path)
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn schedule_app_restart_for_update(&self) {
+        let backend = self.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            backend.persist_main_window_state();
+            let _ = backend.stop_proxy().await;
+            backend.mark_quit_requested(true);
+            backend.inner.app.exit(0);
+        });
     }
 
     async fn update_proxy_binary_internal(&self) -> Result<String> {
@@ -4803,8 +4917,7 @@ fn strip_managed_reasoning_effort_entries(config: &mut Value) -> bool {
             .iter()
             .filter(|entry| {
                 let params = object(entry.get("params"));
-                read_string(params.get("_managedBy"), "")
-                    != "x-cliproxy-desktop-reasoning-effort"
+                read_string(params.get("_managedBy"), "") != "x-cliproxy-desktop-reasoning-effort"
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -4819,7 +4932,10 @@ fn strip_managed_reasoning_effort_entries(config: &mut Value) -> bool {
 fn strip_managed_thinking_entries(config: &mut Value) -> bool {
     let mut changed = false;
     let root = root_object_mut(config).unwrap();
-    if let Some(desktop) = root.get_mut(DESKTOP_METADATA_KEY).and_then(Value::as_object_mut) {
+    if let Some(desktop) = root
+        .get_mut(DESKTOP_METADATA_KEY)
+        .and_then(Value::as_object_mut)
+    {
         if desktop.remove("thinking-budget").is_some() {
             changed = true;
         }
@@ -6267,6 +6383,23 @@ fn desktop_app_asset_suffixes() -> Result<Vec<&'static str>> {
     }
 }
 
+fn desktop_app_asset_match_rank(name: &str, suffixes: &[&str]) -> Option<usize> {
+    let lower_name = name.to_ascii_lowercase();
+    suffixes.iter().enumerate().find_map(|(index, suffix)| {
+        if !lower_name.ends_with(&suffix.to_ascii_lowercase()) {
+            return None;
+        }
+        if *suffix == ".dmg"
+            && ["_x64.dmg", "_x86_64.dmg", "_aarch64.dmg", "_arm64.dmg"]
+                .iter()
+                .any(|marker| lower_name.ends_with(marker))
+        {
+            return None;
+        }
+        Some(index)
+    })
+}
+
 fn select_desktop_app_release_asset(payload: &Value) -> Result<AppReleaseAssetDescriptor> {
     let tag = normalized_string(payload.get("tag_name"))
         .or_else(|| normalized_string(payload.get("name")))
@@ -6279,54 +6412,160 @@ fn select_desktop_app_release_asset(payload: &Value) -> Result<AppReleaseAssetDe
         .ok_or_else(|| anyhow!("桌面应用发布缺少资产列表。"))?;
     let suffixes = desktop_app_asset_suffixes()?;
 
-    for suffix in &suffixes {
-        if let Some(asset) = assets.iter().find(|asset| {
-            normalized_string(asset.get("name"))
-                .map(|name| name.ends_with(suffix))
-                .unwrap_or(false)
-        }) {
-            let asset_name = normalized_string(asset.get("name"))
-                .ok_or_else(|| anyhow!("桌面应用发布资产缺少名称。"))?;
-            let download_url = normalized_string(
-                asset
-                    .get("browser_download_url")
-                    .or_else(|| asset.get("browserDownloadUrl")),
-            )
-            .ok_or_else(|| anyhow!("桌面应用发布资产缺少下载地址。"))?;
+    if let Some(asset) = assets
+        .iter()
+        .filter_map(|asset| {
+            let name = normalized_string(asset.get("name"))?;
+            let rank = desktop_app_asset_match_rank(&name, &suffixes)?;
+            Some((rank, asset))
+        })
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, asset)| asset)
+    {
+        let asset_name = normalized_string(asset.get("name"))
+            .ok_or_else(|| anyhow!("桌面应用发布资产缺少名称。"))?;
+        let download_url = normalized_string(
+            asset
+                .get("browser_download_url")
+                .or_else(|| asset.get("browserDownloadUrl")),
+        )
+        .ok_or_else(|| anyhow!("桌面应用发布资产缺少下载地址。"))?;
 
-            return Ok(AppReleaseAssetDescriptor {
-                asset_name,
-                download_url,
-                tag,
-                version,
-            });
-        }
+        return Ok(AppReleaseAssetDescriptor {
+            asset_name,
+            download_url,
+            tag,
+            version,
+        });
     }
 
     Err(anyhow!("未找到与当前平台匹配的桌面应用安装包。"))
 }
 
-async fn fetch_latest_app_release_descriptor(client: &Client) -> Result<AppReleaseAssetDescriptor> {
+fn desktop_app_release_expanded_assets_url(tag: &str) -> String {
+    format!("{DESKTOP_APP_RELEASES_EXPANDED_ASSETS_URL_PREFIX}/{tag}")
+}
+
+fn github_api_error_summary(status_code: u16, body_text: &str) -> String {
+    let message = serde_json::from_str::<Value>(body_text)
+        .ok()
+        .and_then(|payload| normalized_string(payload.get("message")))
+        .unwrap_or_else(|| {
+            let summary = body_text
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or_default();
+            if summary.is_empty() {
+                format!("HTTP {status_code}")
+            } else {
+                summary.chars().take(180).collect::<String>()
+            }
+        });
+    format!("GitHub Release API 返回 {status_code}：{message}")
+}
+
+fn select_desktop_app_release_asset_from_html(
+    tag: &str,
+    html: &str,
+) -> Result<AppReleaseAssetDescriptor> {
+    let normalized_tag = if tag.starts_with('v') {
+        tag.to_string()
+    } else {
+        format!("v{tag}")
+    };
+    let version = normalized_tag.trim_start_matches('v').to_string();
+    let suffixes = desktop_app_asset_suffixes()?;
+    let asset_regex = regex::Regex::new(
+        r#"href="(?P<href>/lich13/lich13CPA/releases/download/[^"]+/(?P<name>[^"/]+))""#,
+    )
+    .context("failed to compile desktop app release HTML matcher")?;
+
+    if let Some(captures) = asset_regex
+        .captures_iter(html)
+        .filter_map(|captures| {
+            let name = captures.name("name")?.as_str().to_string();
+            let rank = desktop_app_asset_match_rank(&name, &suffixes)?;
+            Some((rank, captures))
+        })
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, captures)| captures)
+    {
+        let asset_name = captures
+            .name("name")
+            .map(|value| value.as_str().to_string())
+            .ok_or_else(|| anyhow!("HTML 回退解析时缺少资产名称。"))?;
+        let href = captures
+            .name("href")
+            .map(|value| value.as_str())
+            .ok_or_else(|| anyhow!("HTML 回退解析时缺少下载地址。"))?;
+        return Ok(AppReleaseAssetDescriptor {
+            asset_name,
+            download_url: format!("https://github.com{href}"),
+            tag: normalized_tag,
+            version,
+        });
+    }
+
+    Err(anyhow!("HTML 回退中未找到与当前平台匹配的安装包。"))
+}
+
+async fn fetch_latest_app_release_descriptor_from_html(
+    client: &Client,
+    tag: &str,
+) -> Result<AppReleaseAssetDescriptor> {
     let response = client
+        .get(desktop_app_release_expanded_assets_url(tag))
+        .send()
+        .await?;
+    let body_text = response.error_for_status()?.text().await?;
+    select_desktop_app_release_asset_from_html(tag, &body_text)
+}
+
+async fn fetch_latest_app_release_descriptor(client: &Client) -> Result<AppReleaseAssetDescriptor> {
+    let api_error = match client
         .get(DESKTOP_APP_RELEASES_LATEST_API_URL)
         .header("accept", "application/vnd.github+json")
         .send()
-        .await?;
-
-    if response.status().is_success() {
-        let body_text = response.text().await?;
-        if let Ok(payload) = serde_json::from_str::<Value>(&body_text) {
-            return select_desktop_app_release_asset(&payload);
+        .await
+    {
+        Ok(response) => {
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            if status.is_success() {
+                match serde_json::from_str::<Value>(&body_text) {
+                    Ok(payload) => match select_desktop_app_release_asset(&payload) {
+                        Ok(descriptor) => return Ok(descriptor),
+                        Err(error) => Some(error.to_string()),
+                    },
+                    Err(error) => Some(format!("GitHub Release API 响应无法解析：{error}")),
+                }
+            } else {
+                Some(github_api_error_summary(status.as_u16(), &body_text))
+            }
         }
-    }
+        Err(error) => Some(format!("GitHub Release API 请求失败：{error}")),
+    };
 
     let response = client.get(DESKTOP_APP_RELEASES_LATEST_URL).send().await?;
     let url = response.url().as_str().to_string();
     let tag = regex_capture(&url, r"/releases/tag/([^/?#]+)")
         .ok_or_else(|| anyhow!("无法解析桌面应用最新发布版本。"))?;
-    Err(anyhow!(
-        "无法从 GitHub Release API 解析桌面应用资产，请检查最新发布 {tag} 是否包含当前平台安装包。"
-    ))
+
+    match fetch_latest_app_release_descriptor_from_html(client, &tag).await {
+        Ok(descriptor) => Ok(descriptor),
+        Err(html_error) => {
+            let mut reasons = Vec::new();
+            if let Some(api_error) = api_error {
+                reasons.push(api_error);
+            }
+            reasons.push(format!("HTML 资产回退失败：{html_error}"));
+            Err(anyhow!(
+                "无法解析桌面应用更新资产（最新发布 {tag}）：{}",
+                reasons.join("；")
+            ))
+        }
+    }
 }
 
 fn extract_archive(archive_path: &Path, destination: &Path, archive_kind: &str) -> Result<()> {
@@ -7399,6 +7638,34 @@ mod tests {
     }
 
     #[test]
+    fn desktop_app_release_html_fallback_parses_current_platform_asset() {
+        let html = r#"
+<div class="Box-footer">
+  <a href="/lich13/lich13CPA/releases/download/v0.1.3/lich13CPA_0.1.3_aarch64.dmg">lich13CPA_0.1.3_aarch64.dmg</a>
+  <a href="/lich13/lich13CPA/releases/download/v0.1.3/lich13CPA_0.1.3_x64.dmg">lich13CPA_0.1.3_x64.dmg</a>
+  <a href="/lich13/lich13CPA/releases/download/v0.1.3/lich13CPA_0.1.3_x64-setup.exe">lich13CPA_0.1.3_x64-setup.exe</a>
+  <a href="/lich13/lich13CPA/releases/download/v0.1.3/lich13CPA_0.1.3_arm64-setup.exe">lich13CPA_0.1.3_arm64-setup.exe</a>
+</div>
+"#;
+
+        let descriptor = select_desktop_app_release_asset_from_html("v0.1.3", html).unwrap();
+
+        if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+            assert_eq!(descriptor.asset_name, "lich13CPA_0.1.3_aarch64.dmg");
+            assert_eq!(
+                descriptor.download_url,
+                "https://github.com/lich13/lich13CPA/releases/download/v0.1.3/lich13CPA_0.1.3_aarch64.dmg"
+            );
+        } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
+            assert_eq!(descriptor.asset_name, "lich13CPA_0.1.3_x64.dmg");
+        } else if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
+            assert_eq!(descriptor.asset_name, "lich13CPA_0.1.3_x64-setup.exe");
+        } else if cfg!(target_os = "windows") && cfg!(target_arch = "aarch64") {
+            assert_eq!(descriptor.asset_name, "lich13CPA_0.1.3_arm64-setup.exe");
+        }
+    }
+
+    #[test]
     fn binary_update_available_when_selected_channel_differs() {
         assert_eq!(
             compute_proxy_binary_update_available(
@@ -8099,6 +8366,86 @@ fn resolve_inside_directory(directory: &Path, file_name: &str) -> Result<PathBuf
         return Err(anyhow!("目标文件不在允许的目录内。"));
     }
     Ok(target)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_silent_update_script() -> &'static str {
+    r#"#!/bin/bash
+set -euo pipefail
+
+DMG_PATH="$1"
+TARGET_APP="$2"
+EXPECTED_VERSION="$3"
+WAIT_PID="$4"
+LOG_PATH="$5"
+MOUNT_DIR="$6"
+STAGING_APP="$7"
+BACKUP_APP="$8"
+
+exec >>"$LOG_PATH" 2>&1
+
+SUCCESS=0
+
+cleanup() {
+  if mount | grep -Fq "on $MOUNT_DIR "; then
+    hdiutil detach "$MOUNT_DIR" -force -quiet || true
+  fi
+  rm -rf "$MOUNT_DIR" "$STAGING_APP"
+  if [[ "$SUCCESS" != "1" && -e "$BACKUP_APP" && ! -e "$TARGET_APP" ]]; then
+    mv "$BACKUP_APP" "$TARGET_APP" || true
+  fi
+}
+trap cleanup EXIT
+
+while kill -0 "$WAIT_PID" 2>/dev/null; do
+  sleep 1
+done
+
+rm -rf "$MOUNT_DIR" "$STAGING_APP" "$BACKUP_APP"
+mkdir -p "$MOUNT_DIR"
+
+hdiutil attach "$DMG_PATH" -nobrowse -mountpoint "$MOUNT_DIR" -quiet
+
+SOURCE_APP="$(find "$MOUNT_DIR" -maxdepth 1 -name '*.app' -print -quit)"
+if [[ -z "$SOURCE_APP" ]]; then
+  echo "No .app bundle found in mounted DMG."
+  exit 1
+fi
+
+ditto "$SOURCE_APP" "$STAGING_APP"
+
+if [[ -n "$EXPECTED_VERSION" ]]; then
+  STAGED_VERSION="$(defaults read "$STAGING_APP/Contents/Info" CFBundleShortVersionString 2>/dev/null || true)"
+  if [[ "$STAGED_VERSION" != "$EXPECTED_VERSION" ]]; then
+    echo "Staged app version mismatch: expected $EXPECTED_VERSION, got ${STAGED_VERSION:-<empty>}."
+    exit 1
+  fi
+fi
+
+if [[ -e "$TARGET_APP" ]]; then
+  mv "$TARGET_APP" "$BACKUP_APP"
+fi
+
+mv "$STAGING_APP" "$TARGET_APP"
+
+if [[ -n "$EXPECTED_VERSION" ]]; then
+  INSTALLED_VERSION="$(defaults read "$TARGET_APP/Contents/Info" CFBundleShortVersionString 2>/dev/null || true)"
+  if [[ "$INSTALLED_VERSION" != "$EXPECTED_VERSION" ]]; then
+    echo "Installed app version mismatch: expected $EXPECTED_VERSION, got ${INSTALLED_VERSION:-<empty>}."
+    rm -rf "$TARGET_APP"
+    if [[ -e "$BACKUP_APP" ]]; then
+      mv "$BACKUP_APP" "$TARGET_APP"
+    fi
+    exit 1
+  fi
+fi
+
+rm -rf "$BACKUP_APP"
+xattr -dr com.apple.quarantine "$TARGET_APP" 2>/dev/null || true
+SUCCESS=1
+open "$TARGET_APP"
+rm -f "$0"
+"#
 }
 
 fn infer_state_from_url(auth_url: &str) -> Option<String> {
