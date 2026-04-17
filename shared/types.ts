@@ -1,4 +1,4 @@
-export type AppPage = 'dashboard' | 'providers' | 'auth-files' | 'usage' | 'logs' | 'settings'
+export type AppPage = 'dashboard' | 'providers' | 'auth-files' | 'logs' | 'settings'
 
 export type SidecarChannel = 'main' | 'plus'
 
@@ -455,7 +455,6 @@ export interface DesktopAppState {
   aiProviders: AiProvidersState
   authFiles: AuthFileRecord[]
   providerImports: ProviderImportSummary[]
-  usageSummary: UsageSummary
   logs: LogEntry[]
   warnings: string[]
 }
@@ -467,8 +466,6 @@ export interface DesktopBridge {
   startProxy: () => Promise<DesktopAppState>
   stopProxy: () => Promise<DesktopAppState>
   syncRuntimeConfig: () => Promise<DesktopAppState>
-  refreshUsage: () => Promise<DesktopAppState>
-  getUsageSummary: (query?: UsageSummaryQuery) => Promise<UsageSummary>
   getProviderAuthUrl: (provider: ProviderAuthProvider) => Promise<ProviderAuthLaunchResult>
   checkProviderAuthStatus: (
     provider: ProviderAuthProvider,

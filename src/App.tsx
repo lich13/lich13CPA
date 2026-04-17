@@ -1,5 +1,4 @@
 import {
-  BarChart3,
   Bot,
   CircleAlert,
   Download,
@@ -218,7 +217,6 @@ const PAGES: PageMeta[] = [
   { id: 'dashboard', label: '仪表盘', icon: LayoutDashboard },
   { id: 'providers', label: 'AI 提供商', icon: Bot },
   { id: 'auth-files', label: '认证文件', icon: ShieldCheck },
-  { id: 'usage', label: '用量统计', icon: BarChart3 },
   { id: 'logs', label: '日志', icon: ScrollText },
   { id: 'settings', label: '设置', icon: Settings2 },
 ]
@@ -1134,13 +1132,8 @@ function getFeaturedQuotaFiles(files: AuthFileRecord[]): AuthFileRecord[] {
       if (left.enabled !== right.enabled) {
         return left.enabled ? -1 : 1
       }
-
-      if (left.totalRequests !== right.totalRequests) {
-        return right.totalRequests - left.totalRequests
-      }
-
-      const rightRank = getDateRank(right.lastUsedAt, right.updatedAt, right.modifiedAt)
-      const leftRank = getDateRank(left.lastUsedAt, left.updatedAt, left.modifiedAt)
+      const rightRank = getDateRank(right.updatedAt, right.modifiedAt, right.createdAt)
+      const leftRank = getDateRank(left.updatedAt, left.modifiedAt, left.createdAt)
 
       if (leftRank !== rightRank) {
         return rightRank - leftRank
@@ -1509,13 +1502,10 @@ function App() {
   const preferredPricingModels = collectPreferredPricingModels(appState)
   const sortedUsagePricingRules = getOrderedUsagePricingRules(
     usagePricingConfig.rules,
-    usageSummary ?? appState?.usageSummary ?? null,
+    usageSummary,
     preferredPricingModels,
   )
   const usagePricing = computeUsagePricing(usageSummary, usagePricingConfig)
-  const refreshUsageSummary = useEffectEvent((query: UsageSummaryQuery) => {
-    void fetchUsageSummaryForRange(query)
-  })
   const refreshQuotaClock = useEffectEvent(() => {
     setQuotaClockMs(Date.now())
   })
@@ -1889,71 +1879,19 @@ async function loadState() {
     )
   }
 
-  async function fetchUsageSummaryForRange(query: UsageSummaryQuery, announce = false) {
-    setUsageLoading(true)
-
-    try {
-      const summary = await window.cliproxy.getUsageSummary(query)
-
-      if (!mountedRef.current) {
-        return false
-      }
-
-      setUsageSummary(summary)
-
-      if (announce) {
-        pushNotice('success', '用量统计已刷新')
-      }
-
-      return true
-    } catch (error) {
-      if (!mountedRef.current) {
-        return false
-      }
-
-      setUsageSummary({
-        available: false,
-        rangePreset: query.preset ?? DEFAULT_USAGE_PRESET,
-        rangeLabel: '查询失败',
-        rangeStartAt: query.startAt ?? null,
-        rangeEndAt: query.endAt ?? null,
-        rangeGranularity: 'day',
-        usedDetailRange: false,
-        totalRequests: 0,
-        successCount: 0,
-        failureCount: 0,
-        totalTokens: 0,
-        netTokens: 0,
-        billableInputTokens: 0,
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedTokens: 0,
-        cacheCreationTokens: 0,
-        reasoningTokens: 0,
-        requestsByDay: [],
-        tokensByDay: [],
-        topModels: [],
-        lastUpdatedAt: null,
-        error: getErrorText(error),
-      })
-
-      if (announce) {
-        pushNotice('error', getErrorText(error))
-      }
-
-      return false
-    } finally {
-      if (mountedRef.current) {
-        setUsageLoading(false)
-      }
+  async function fetchUsageSummaryForRange(_query: UsageSummaryQuery, announce = false) {
+    if (announce) {
+      pushNotice('error', '用量统计模块已移除。')
     }
+
+    return false
   }
 
   async function refreshCurrentPage() {
     setBusyAction('refresh-view')
 
     try {
-      const nextState = await window.cliproxy.refreshUsage()
+      const nextState = await window.cliproxy.getAppState()
 
       if (!mountedRef.current) {
         return
@@ -1972,18 +1910,7 @@ async function loadState() {
         quotaFailed = results.some((result) => !result)
       }
 
-      let usageQueryFailed = false
-
-      if (currentPage === 'usage') {
-        usageQueryFailed = !(await fetchUsageSummaryForRange(usageQuery, false))
-      }
-
       if (!mountedRef.current) {
-        return
-      }
-
-      if (quotaFailed && usageQueryFailed) {
-        pushNotice('error', '用量统计和认证额度刷新失败，请稍后重试。')
         return
       }
 
@@ -1991,21 +1918,16 @@ async function loadState() {
         pushNotice(
           'error',
           currentPage === 'dashboard'
-            ? '仪表盘用量已刷新，但部分认证额度刷新失败。'
+            ? '仪表盘已刷新，但部分认证额度刷新失败。'
             : '当前页面已刷新，但部分认证额度刷新失败。',
         )
-        return
-      }
-
-      if (usageQueryFailed) {
-        pushNotice('error', '基础数据已刷新，但时间范围统计刷新失败。')
         return
       }
 
       if (currentPage === 'dashboard') {
         pushNotice(
           'success',
-          quotaTargets.length > 0 ? '已刷新仪表盘用量和认证额度' : '已刷新仪表盘',
+          quotaTargets.length > 0 ? '已刷新仪表盘和认证额度' : '已刷新仪表盘',
         )
         return
       }
@@ -2015,11 +1937,6 @@ async function loadState() {
           'success',
           quotaTargets.length > 0 ? '已刷新认证额度' : '已刷新认证文件列表',
         )
-        return
-      }
-
-      if (currentPage === 'usage') {
-        pushNotice('success', '已刷新用量统计')
         return
       }
 
@@ -2044,25 +1961,7 @@ async function loadState() {
   }
 
   function applyCustomUsageRange() {
-    const startAt = toIsoDateTime(usageCustomRangeDraft.startAt)
-    const endAt = toIsoDateTime(usageCustomRangeDraft.endAt)
-
-    if (!startAt && !endAt) {
-      pushNotice('error', '请至少填写一个时间边界。')
-      return
-    }
-
-    if (startAt && endAt && new Date(startAt).getTime() > new Date(endAt).getTime()) {
-      pushNotice('error', '开始时间不能晚于结束时间。')
-      return
-    }
-
-    setUsagePreset('custom')
-    setUsageQuery({
-      preset: 'custom',
-      startAt,
-      endAt,
-    })
+    pushNotice('error', '用量统计模块已移除。')
   }
 
   async function saveSettings() {
@@ -2289,18 +2188,6 @@ async function loadState() {
     })
   }, [appState, currentPage])
 
-  useEffect(() => {
-    if (!appState) {
-      return
-    }
-
-    if (currentPage !== 'usage') {
-      return
-    }
-
-    refreshUsageSummary(usageQuery)
-  }, [appState?.proxyStatus.running, currentPage, usageQuery])
-
   if (!appState) {
     return (
       <div className="loading-shell">
@@ -2341,19 +2228,22 @@ async function loadState() {
   }
 
   function renderDashboard() {
-    const dashboardPricing = computeUsagePricing(state.usageSummary, usagePricingConfig)
     const featuredQuotaFiles = getFeaturedQuotaFiles(state.authFiles)
-    const usageModels = state.usageSummary.topModels.filter(
-      (item) => item.requests > 0 || item.totalTokens > 0,
-    )
-    const cacheHitRate =
-      state.usageSummary.inputTokens > 0
-        ? (state.usageSummary.cachedTokens / state.usageSummary.inputTokens) * 100
-        : 0
+    const enabledFiles = state.authFiles.filter((file) => file.enabled).length
+    const quotaReadyFiles = state.authFiles.filter(
+      (file) => canFetchQuota(file) && !file.unavailable,
+    ).length
+    const activeProviders = state.providerImports.filter((entry) => entry.totalCount > 0).length
+    const latestAuthChange = [...state.authFiles]
+      .map((file) => getDateRank(file.modifiedAt, file.updatedAt, file.createdAt))
+      .sort((left, right) => right - left)[0]
+    const importSummaries = state.providerImports
+      .filter((entry) => entry.totalCount > 0)
+      .slice(0, 6)
 
     return (
       <div className="page-stack">
-        <section className="metrics-grid">
+        <section className="metrics-grid dashboard-metrics-grid">
           <article className="metric-card metric-card-wide">
             <span className="metric-label">代理状态</span>
             <strong>{state.proxyStatus.running ? '运行中' : '未启动'}</strong>
@@ -2379,21 +2269,6 @@ async function loadState() {
                 打开 WebUI
               </button>
               <button
-                className="ghost-button danger"
-                disabled={busyAction === 'stop-quit'}
-                onClick={() =>
-                  void runAction(
-                    'stop-quit',
-                    () => window.cliproxy.stopProxyAndQuit(),
-                    '正在退出程序',
-                  )
-                }
-                type="button"
-              >
-                <Square size={16} />
-                停止代理并退出
-              </button>
-              <button
                 className="ghost-button"
                 disabled={!state.proxyStatus.running || busyAction === 'sync-runtime-config'}
                 onClick={() =>
@@ -2408,32 +2283,21 @@ async function loadState() {
                 <Save size={16} />
                 固化 WebUI
               </button>
-            </div>
-          </article>
-
-          <article className="metric-card">
-            <span className="metric-label">请求统计</span>
-            <strong>{formatCount(state.usageSummary.totalRequests)}</strong>
-            <span className="metric-help">
-              成功 {formatCount(state.usageSummary.successCount)} · 失败{' '}
-              {formatCount(state.usageSummary.failureCount)}
-            </span>
-            <div className="metric-pairs">
-              <span>输入 Tokens {formatCount(state.usageSummary.inputTokens)}</span>
-              <span>输出 Tokens {formatCount(state.usageSummary.outputTokens)}</span>
-            </div>
-          </article>
-
-          <article className="metric-card metric-card-highlight">
-            <span className="metric-label">预估成本</span>
-            <strong>{formatMoney(dashboardPricing.estimatedCost, usagePricingConfig.currency)}</strong>
-            <span className="metric-help">
-              输入 {formatMoney(dashboardPricing.inputCost, usagePricingConfig.currency)} · 输出{' '}
-              {formatMoney(dashboardPricing.outputCost, usagePricingConfig.currency)}
-            </span>
-            <div className="metric-pairs">
-              <span>缓存读 {formatMoney(dashboardPricing.cacheReadCost, usagePricingConfig.currency)}</span>
-              <span>缓存写 {formatMoney(dashboardPricing.cacheWriteCost, usagePricingConfig.currency)}</span>
+              <button
+                className="ghost-button danger"
+                disabled={busyAction === 'stop-quit'}
+                onClick={() =>
+                  void runAction(
+                    'stop-quit',
+                    () => window.cliproxy.stopProxyAndQuit(),
+                    '正在退出程序',
+                  )
+                }
+                type="button"
+              >
+                <Square size={16} />
+                停止代理并退出
+              </button>
             </div>
           </article>
 
@@ -2531,14 +2395,30 @@ async function loadState() {
               <span className="field-help">更新异常：{state.appUpdate.lastError}</span>
             ) : null}
           </article>
+
+          <article className="metric-card">
+            <span className="metric-label">认证概览</span>
+            <strong>{formatCount(state.authFiles.length)}</strong>
+            <span className="metric-help">
+              启用 {formatCount(enabledFiles)} · 可读额度 {formatCount(quotaReadyFiles)}
+            </span>
+            <div className="metric-pairs metric-pairs-compact">
+              <span>覆盖提供商 {formatCount(activeProviders)}</span>
+              <span>
+                {latestAuthChange
+                  ? `最近更新 ${formatTime(new Date(latestAuthChange).toISOString())}`
+                  : '暂无更新时间'}
+              </span>
+            </div>
+          </article>
         </section>
 
-        <section className="dashboard-grid">
+        <section className="dashboard-grid dashboard-grid-compact">
           <section className="section-card dashboard-section">
             <div className="section-head">
               <div>
                 <h2>认证额度</h2>
-                <p>首页只保留关键额度，优先显示已启用认证文件。</p>
+                <p>优先展示启用中的关键额度，并保留一键刷新入口。</p>
               </div>
               <div className="action-row">
                 <button
@@ -2573,12 +2453,12 @@ async function loadState() {
               <div className="quota-spotlight-grid">
                 {featuredQuotaFiles.map((file) => {
                   const quotaState = quotaStateByFile[file.name]
-              const summary = quotaState?.summary ?? null
-              const primaryItem = summary ? getPrimaryQuotaItem(summary) : null
-              const dashboardQuotaItems = summary ? getDashboardQuotaItems(summary) : []
-              const noteItem =
-                summary?.metas.find((item) => item.label === '说明' && item.value.trim()) ?? null
-              const planLabel = formatPlanLabel(summary?.planType ?? file.planType)
+                  const summary = quotaState?.summary ?? null
+                  const primaryItem = summary ? getPrimaryQuotaItem(summary) : null
+                  const dashboardQuotaItems = summary ? getDashboardQuotaItems(summary) : []
+                  const noteItem =
+                    summary?.metas.find((item) => item.label === '说明' && item.value.trim()) ?? null
+                  const planLabel = formatPlanLabel(summary?.planType ?? file.planType)
 
                   return (
                     <article className="quota-spotlight-card" key={file.name}>
@@ -2610,9 +2490,7 @@ async function loadState() {
                                   <div className="quota-progress-head">
                                     <span>{formatDashboardQuotaLabel(item)}</span>
                                     <strong>
-                                      {usedPercent === null
-                                        ? '\u5f85\u540c\u6b65'
-                                        : `\u5df2\u4f7f\u7528 ${formatPercent(usedPercent)}`}
+                                      {usedPercent === null ? '待同步' : `已使用 ${formatPercent(usedPercent)}`}
                                     </strong>
                                   </div>
                                   <div className="quota-bar quota-spotlight-bar">
@@ -2639,9 +2517,7 @@ async function loadState() {
                                   ? '已启用'
                                   : '未启用'}
                             </span>
-                            <span>
-                              {quotaState?.error ? '刷新失败，显示上次结果' : '额度已同步'}
-                            </span>
+                            <span>{quotaState?.error ? '刷新失败，显示上次结果' : '额度已同步'}</span>
                           </div>
                         </>
                       ) : summary && noteItem ? (
@@ -2661,158 +2537,92 @@ async function loadState() {
           <section className="section-card dashboard-section">
             <div className="section-head">
               <div>
-                <h2>Token 使用统计</h2>
-                <p>总消耗、净消耗、缓存命中和模型明细分开展示。</p>
+                <h2>快捷授权</h2>
+                <p>保留高频导入和 OAuth 入口，整体布局更紧凑。</p>
               </div>
             </div>
 
-            {!state.proxyStatus.running ? (
-              <div className="quota-empty">启动代理后开始累计 token 使用统计。</div>
-            ) : state.usageSummary.error ? (
-              <div className="quota-empty error">{state.usageSummary.error}</div>
+            {importSummaries.length > 0 ? (
+              <div className="dashboard-import-summary-list">
+                {importSummaries.map((item) => (
+                  <article className="dashboard-import-summary-item" key={item.id}>
+                    <strong>{item.label}</strong>
+                    <span>
+                      总 {formatCount(item.totalCount)} · 启用 {formatCount(item.enabledCount)} · 停用{' '}
+                      {formatCount(item.disabledCount)}
+                    </span>
+                  </article>
+                ))}
+              </div>
             ) : (
-              <div className="usage-panel">
-              <div className="usage-snapshot-grid">
-                <article className="usage-snapshot-card">
-                  <span className="metric-label">总消耗</span>
-                  <strong>{formatCount(state.usageSummary.totalTokens)}</strong>
-                  <span className="metric-help">原始输入 + 输出</span>
-                </article>
-                <article className="usage-snapshot-card">
-                  <span className="metric-label">预估成本</span>
-                  <strong>{formatMoney(dashboardPricing.estimatedCost, usagePricingConfig.currency)}</strong>
-                  <span className="metric-help">输入 + 输出 + 缓存读写估算</span>
-                </article>
-                <article className="usage-snapshot-card">
-                  <span className="metric-label">缓存命中</span>
-                  <strong>{formatCount(state.usageSummary.cachedTokens)}</strong>
-                    <span className="metric-help">重复上下文命中量</span>
-                  </article>
-                  <article className="usage-snapshot-card">
-                    <span className="metric-label">计费输入</span>
-                    <strong>{formatCount(state.usageSummary.billableInputTokens)}</strong>
-                    <span className="metric-help">输入减去缓存命中</span>
-                  </article>
-                </div>
-
-                <article className="usage-breakdown-card">
-                  <div className="quota-head">
-                    <strong>缓存命中率</strong>
-                    <span>{formatPercent(cacheHitRate)}</span>
-                  </div>
-                  <div className="quota-bar">
-                    <span
-                      className="quota-bar-fill"
-                      style={{ width: `${Math.max(0, Math.min(100, cacheHitRate))}%` }}
-                    />
-                  </div>
-                  <div className="quota-meta">
-                    <span>原始输入 {formatCount(state.usageSummary.inputTokens)}</span>
-                    <span>Reasoning {formatCount(state.usageSummary.reasoningTokens)}</span>
-                  </div>
-                </article>
-
-                {usageModels.length > 0 ? (
-                  <div className="usage-model-list">
-                    {usageModels.slice(0, 5).map((item) => (
-                      <article className="usage-model-row" key={item.model}>
-                        <div className="usage-model-copy">
-                          <strong>{item.model}</strong>
-                          <span>
-                            {formatCount(item.requests)} 请求 · 成功 {formatCount(item.successCount)}
-                            {' · '}失败 {formatCount(item.failureCount)}
-                          </span>
-                        </div>
-                        <div className="usage-model-metrics">
-                          <span>总 {formatCount(item.totalTokens)}</span>
-                          <span>净 {formatCount(item.netTokens)}</span>
-                          <span>缓存 {formatCount(item.cachedTokens)}</span>
-                        </div>
-                      </article>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="quota-empty">暂无模型级 token 明细。</div>
-                )}
-              </div>
+              <div className="quota-empty">当前还没有已导入的提供商认证。</div>
             )}
-          </section>
-        </section>
 
-        <section className="section-card">
-          <div className="section-head">
-            <div>
-              <h2>供应商授权</h2>
-              <p>点 + 跳转授权网页，或直接导入现成认证文件。</p>
-            </div>
-          </div>
-          <div className="supplier-grid">
-            {SUPPLIERS.map((supplier) => {
-              const summary = supplier.summaryIds
-                ? supplier.summaryIds.reduce(
-                    (accumulator, id) => {
-                      const item = state.providerImports.find((entry) => entry.id === id)
-                      return {
-                        enabledCount: accumulator.enabledCount + (item?.enabledCount ?? 0),
-                        disabledCount: accumulator.disabledCount + (item?.disabledCount ?? 0),
-                        totalCount: accumulator.totalCount + (item?.totalCount ?? 0),
-                      }
-                    },
-                    { enabledCount: 0, disabledCount: 0, totalCount: 0 },
-                  )
-                : state.providerImports.find((entry) => entry.id === supplier.id) ?? {
-                    enabledCount: 0,
-                    disabledCount: 0,
-                    totalCount: 0,
-                  }
-
-              return (
-                <article
-                  className={`supplier-card theme-${supplier.theme}`}
-                  key={supplier.id}
-                >
-                  <div className="supplier-head">
-                    <div>
-                      <strong>{supplier.label}</strong>
-                      <span>{supplier.description}</span>
-                    </div>
-                    <div className="supplier-card-actions">
-                      <button
-                        className="ghost-button supplier-import-button"
-                        disabled={busyAction === `pick-auth-${supplier.id}`}
-                        onClick={() =>
-                          void runStateAction(
-                            `pick-auth-${supplier.id}`,
-                            () => window.cliproxy.pickAuthFiles(supplier.id),
-                            `已导入 ${supplier.label} 认证文件`,
-                          )
+            <div className="supplier-grid">
+              {SUPPLIERS.map((supplier) => {
+                const summary = supplier.summaryIds
+                  ? supplier.summaryIds.reduce(
+                      (accumulator, id) => {
+                        const item = state.providerImports.find((entry) => entry.id === id)
+                        return {
+                          enabledCount: accumulator.enabledCount + (item?.enabledCount ?? 0),
+                          disabledCount: accumulator.disabledCount + (item?.disabledCount ?? 0),
+                          totalCount: accumulator.totalCount + (item?.totalCount ?? 0),
                         }
-                        type="button"
-                      >
-                        <HardDriveUpload size={16} />
-                        导入
-                      </button>
-                      <button
-                        className="icon-button"
-                        disabled={busyAction === `auth-${supplier.id}`}
-                        onClick={() => {
-                          void launchSupplierAuth(supplier)
-                        }}
-                        type="button"
-                      >
-                        <Plus size={16} />
-                      </button>
+                      },
+                      { enabledCount: 0, disabledCount: 0, totalCount: 0 },
+                    )
+                  : state.providerImports.find((entry) => entry.id === supplier.id) ?? {
+                      enabledCount: 0,
+                      disabledCount: 0,
+                      totalCount: 0,
+                    }
+
+                return (
+                  <article className={`supplier-card theme-${supplier.theme}`} key={supplier.id}>
+                    <div className="supplier-head">
+                      <div>
+                        <strong>{supplier.label}</strong>
+                        <span>{supplier.description}</span>
+                      </div>
+                      <div className="supplier-card-actions">
+                        <button
+                          className="ghost-button supplier-import-button"
+                          disabled={busyAction === `pick-auth-${supplier.id}`}
+                          onClick={() =>
+                            void runStateAction(
+                              `pick-auth-${supplier.id}`,
+                              () => window.cliproxy.pickAuthFiles(supplier.id),
+                              `已导入 ${supplier.label} 认证文件`,
+                            )
+                          }
+                          type="button"
+                        >
+                          <HardDriveUpload size={16} />
+                          导入
+                        </button>
+                        <button
+                          className="icon-button"
+                          disabled={busyAction === `auth-${supplier.id}`}
+                          onClick={() => {
+                            void launchSupplierAuth(supplier)
+                          }}
+                          type="button"
+                        >
+                          <Plus size={16} />
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                  <div className="supplier-stats">
-                    <span>总数 {summary.totalCount}</span>
-                    <span>启用 {summary.enabledCount}</span>
-                    <span>停用 {summary.disabledCount}</span>
-                  </div>
-                </article>
-              )
-            })}
-          </div>
+                    <div className="supplier-stats">
+                      <span>总数 {summary.totalCount}</span>
+                      <span>启用 {summary.enabledCount}</span>
+                      <span>停用 {summary.disabledCount}</span>
+                    </div>
+                  </article>
+                )
+              })}
+            </div>
+          </section>
         </section>
       </div>
     )
@@ -4023,7 +3833,7 @@ async function loadState() {
     ).length
     const activeProviders = state.providerImports.filter((entry) => entry.totalCount > 0).length
     const latestModifiedAt = [...state.authFiles]
-      .map((file) => getDateRank(file.modifiedAt, file.updatedAt, file.lastUsedAt))
+      .map((file) => getDateRank(file.modifiedAt, file.updatedAt, file.createdAt))
       .sort((left, right) => right - left)[0]
 
     return (
@@ -4155,14 +3965,8 @@ async function loadState() {
                               <strong>{identitySummary || '未解析到身份字段'}</strong>
                             </div>
                             <div className="auth-file-simple-row">
-                              <span>请求统计</span>
-                              <strong>
-                                总 {formatCount(file.totalRequests)} · 成 {formatCount(file.successCount)} · 败 {formatCount(file.failureCount)}
-                              </strong>
-                            </div>
-                            <div className="auth-file-simple-row">
-                              <span>最后使用</span>
-                              <strong>{formatTime(file.lastUsedAt)}</strong>
+                              <span>同步状态</span>
+                              <strong>{file.statusMessage || file.status || '等待同步'}</strong>
                             </div>
                             <div className="auth-file-simple-row auth-file-simple-path">
                               <span>文件路径</span>
@@ -4509,10 +4313,6 @@ async function loadState() {
 
     if (currentPage === 'auth-files') {
       return renderAuthFiles()
-    }
-
-    if (currentPage === 'usage') {
-      return renderUsagePage()
     }
 
     if (currentPage === 'logs') {

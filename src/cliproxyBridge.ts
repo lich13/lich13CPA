@@ -15,8 +15,6 @@ import type {
   SaveAiProviderInput,
   SaveKnownSettingsInput,
   SaveProviderInput,
-  UsageSummary,
-  UsageSummaryQuery,
 } from '../shared/types'
 
 const STATE_CHANGED_EVENT = 'cliproxy://state-changed'
@@ -39,8 +37,6 @@ function createUnavailableBridge(): DesktopBridge {
     startProxy: () => unavailable<DesktopAppState>(),
     stopProxy: () => unavailable<DesktopAppState>(),
     syncRuntimeConfig: () => unavailable<DesktopAppState>(),
-    refreshUsage: () => unavailable<DesktopAppState>(),
-    getUsageSummary: () => unavailable<UsageSummary>(),
     getProviderAuthUrl: () => unavailable<ProviderAuthLaunchResult>(),
     checkProviderAuthStatus: () => unavailable<ProviderAuthStatusResult>(),
     checkProxyBinaryUpdate: () => unavailable<DesktopAppState>(),
@@ -100,9 +96,6 @@ function createTauriBridge(): DesktopBridge {
     startProxy: () => invoke<DesktopAppState>('start_proxy'),
     stopProxy: () => invoke<DesktopAppState>('stop_proxy'),
     syncRuntimeConfig: () => invoke<DesktopAppState>('sync_runtime_config'),
-    refreshUsage: () => invoke<DesktopAppState>('refresh_usage'),
-    getUsageSummary: (query?: UsageSummaryQuery) =>
-      invoke<UsageSummary>('get_usage_summary', { query: query ?? null }),
     getProviderAuthUrl: (provider: ProviderAuthProvider) =>
       invoke<ProviderAuthLaunchResult>('get_provider_auth_url', { provider }),
     checkProviderAuthStatus: (provider: ProviderAuthProvider, state: string) =>

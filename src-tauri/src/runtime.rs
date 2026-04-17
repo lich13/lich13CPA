@@ -851,7 +851,6 @@ impl Backend {
     pub async fn stop_proxy(&self) -> Result<Value> {
         if !self.is_proxy_running() {
             self.finalize_proxy_stop(None, true);
-            self.ingest_usage_logs_to_store().ok();
             self.emit_state_changed();
             return self.build_app_state(None).await;
         }
@@ -889,7 +888,6 @@ impl Backend {
         }
 
         self.finalize_proxy_stop(None, true);
-        self.ingest_usage_logs_to_store().ok();
         self.emit_state_changed();
         self.build_app_state(None).await
     }
@@ -1070,7 +1068,7 @@ impl Backend {
         self.install_app_update().await?;
         self.emit_state_changed();
         let state = self.build_app_state(None).await?;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.schedule_app_restart_for_update();
         Ok(state)
     }
@@ -1427,7 +1425,6 @@ impl Backend {
     }
 
     pub async fn clear_logs(&self) -> Result<Value> {
-        self.ingest_usage_logs_to_store().ok();
         for entry in fs::read_dir(&self.inner.paths.logs_dir)? {
             let entry = entry?;
             let target_path = entry.path();
@@ -1854,35 +1851,6 @@ impl Backend {
             }
         }
 
-        match self.get_usage_summary(None).await {
-            Ok(summary) => push_result(
-                "get_usage_summary",
-                "ok",
-                json!({
-                    "available": summary.get("available").cloned().unwrap_or(Value::Null),
-                    "requests": summary.pointer("/snapshot/requests").cloned().unwrap_or(Value::Null),
-                }),
-            ),
-            Err(error) => push_result(
-                "get_usage_summary",
-                "error",
-                json!({ "message": error.to_string() }),
-            ),
-        }
-
-        match self.refresh_usage().await {
-            Ok(state) => push_result(
-                "refresh_usage",
-                "ok",
-                json!({ "usageAvailable": state.pointer("/usageSummary/available").cloned().unwrap_or(Value::Null) }),
-            ),
-            Err(error) => push_result(
-                "refresh_usage",
-                "error",
-                json!({ "message": error.to_string() }),
-            ),
-        }
-
         match self.sync_runtime_config().await {
             Ok(state) => push_result(
                 "sync_runtime_config",
@@ -2140,6 +2108,7 @@ impl Backend {
         fs::create_dir_all(&self.inner.paths.base_dir)?;
         fs::create_dir_all(&self.inner.paths.auth_dir)?;
         fs::create_dir_all(&self.inner.paths.logs_dir)?;
+        self.cleanup_legacy_usage_files().ok();
         self.migrate_legacy_runtime_files()?;
         self.migrate_legacy_auth_files()?;
 
@@ -2161,12 +2130,6 @@ impl Backend {
         }
         if !self.inner.paths.gui_state_path.exists() {
             self.write_gui_state_partial(GuiState::default())?;
-        }
-        if !self.inner.paths.usage_stats_path.exists() {
-            fs::write(
-                &self.inner.paths.usage_stats_path,
-                serde_json::to_vec_pretty(&PersistedUsageState::default())?,
-            )?;
         }
         Ok(())
     }
@@ -2478,14 +2441,23 @@ impl Backend {
             &self.inner.paths.gui_state_path,
         )?;
         migrate_path_if_missing(
-            &install_dir.join(USAGE_STATS_FILE_NAME),
-            &self.inner.paths.usage_stats_path,
-        )?;
-        migrate_path_if_missing(
             &install_dir.join(AUTH_DIRECTORY_NAME),
             &self.inner.paths.auth_dir,
         )?;
         migrate_path_if_missing(&install_dir.join("logs"), &self.inner.paths.logs_dir)?;
+
+        Ok(())
+    }
+
+    fn cleanup_legacy_usage_files(&self) -> Result<()> {
+        remove_path_if_exists(&self.inner.paths.usage_stats_path)?;
+        remove_path_if_exists(&self.inner.paths.usage_db_path)?;
+
+        let install_dir = &self.inner.paths.install_dir;
+        if install_dir != &self.inner.paths.base_dir {
+            remove_path_if_exists(&install_dir.join(USAGE_STATS_FILE_NAME))?;
+            remove_path_if_exists(&install_dir.join(USAGE_DB_FILE_NAME))?;
+        }
 
         Ok(())
     }
@@ -2661,7 +2633,7 @@ impl Backend {
         items
     }
 
-    async fn build_app_state(&self, usage_query: Option<&Value>) -> Result<Value> {
+    async fn build_app_state(&self, _usage_query: Option<&Value>) -> Result<Value> {
         self.ensure_app_files()?;
         let initial_gui_state = self.read_gui_state()?;
         let effective_binary_path = self.resolve_binary_path(&initial_gui_state)?;
@@ -2718,55 +2690,18 @@ impl Backend {
         }
 
         let mut auth_files = self.list_auth_files()?;
-        let query = usage_query.cloned().unwrap_or(Value::Null);
-        let mut usage_summary = self
-            .build_usage_summary_from_logs(Some(&query))?
-            .unwrap_or_else(|| empty_usage_summary(None, Some(&query)));
-        let mut management_usage_summary = None::<Value>;
 
         if self.is_proxy_running() {
             let runtime = self.resolve_management_runtime()?;
-            let usage_result = self
-                .fetch_management_json(runtime.0, &runtime.1, "/v0/management/usage")
-                .await;
-            let usage_payload = usage_result.as_ref().ok().cloned();
             let remote_auth_files = self
                 .fetch_management_json(runtime.0, &runtime.1, "/v0/management/auth-files")
                 .await
                 .ok();
 
-            if let Some(payload) = usage_payload.as_ref() {
-                let management_summary = build_usage_summary(payload, Some(&query));
-                management_usage_summary = Some(management_summary.clone());
-                if let Some(local_summary) = self.build_usage_summary_from_logs(Some(&query))? {
-                    usage_summary = if should_use_usage_log_fallback(&management_summary) {
-                        local_summary
-                    } else {
-                        management_summary
-                    };
-                } else {
-                    usage_summary = management_summary;
-                }
-            } else if let Err(error) = usage_result {
-                if !read_bool(usage_summary.get("available"), false) {
-                    usage_summary = empty_usage_summary(Some(error.to_string()), Some(&query));
-                }
-            }
-
             if let Some(payload) = remote_auth_files.as_ref() {
                 let remote_entries = extract_remote_auth_file_entries(payload);
                 let indexed = index_remote_auth_files_by_name(&remote_entries);
-                let usage_stats = if let (Some(usage_payload), Some(management_summary)) =
-                    (usage_payload.as_ref(), management_usage_summary.as_ref())
-                {
-                    if should_use_usage_log_fallback(management_summary) {
-                        HashMap::new()
-                    } else {
-                        collect_usage_stats_by_auth_index(usage_payload)
-                    }
-                } else {
-                    HashMap::new()
-                };
+                let usage_stats = HashMap::new();
                 auth_files = auth_files
                     .into_iter()
                     .map(|file| {
@@ -2861,7 +2796,6 @@ impl Backend {
           "aiProviders": if config_parse_error.is_some() { empty_ai_providers() } else { read_ai_providers(&parsed_config) },
           "authFiles": auth_files,
           "providerImports": provider_imports,
-          "usageSummary": usage_summary,
           "logs": self.inner.logs.lock().unwrap().clone(),
           "warnings": warnings,
         }))
@@ -3669,7 +3603,20 @@ impl Backend {
             );
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            self.schedule_windows_silent_app_update(&installer_path, &descriptor)?;
+            self.append_log(
+                "info",
+                "app",
+                &format!(
+                    "已安排桌面应用静默更新，应用即将自动重启：{}",
+                    installer_path.to_string_lossy()
+                ),
+            );
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         self.open_path(installer_path.to_string_lossy().to_string())?;
 
         {
@@ -3689,7 +3636,12 @@ impl Backend {
             "桌面应用更新安装器已就绪：{}",
             installer_path.to_string_lossy()
         );
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        let completion_message = format!(
+            "桌面应用静默更新安装器已就绪：{}",
+            installer_path.to_string_lossy()
+        );
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let completion_message = format!(
             "已打开桌面应用更新安装包：{}",
             installer_path.to_string_lossy()
@@ -3774,6 +3726,69 @@ impl Backend {
     }
 
     #[cfg(target_os = "macos")]
+    fn schedule_app_restart_for_update(&self) {
+        let backend = self.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            backend.persist_main_window_state();
+            let _ = backend.stop_proxy().await;
+            backend.mark_quit_requested(true);
+            backend.inner.app.exit(0);
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    fn schedule_windows_silent_app_update(
+        &self,
+        installer_path: &Path,
+        descriptor: &AppReleaseAssetDescriptor,
+    ) -> Result<()> {
+        let restart_executable = std::env::current_exe()
+            .context("failed to resolve current executable for desktop app update")?;
+        let updates_dir = installer_path
+            .parent()
+            .ok_or_else(|| anyhow!("无法确定桌面应用更新目录。"))?;
+        let stamp = Utc::now().timestamp_millis();
+        let script_path = updates_dir.join(format!("desktop-app-update-{stamp}.ps1"));
+        let log_path = updates_dir.join(format!("desktop-app-update-{stamp}.log"));
+
+        fs::write(&script_path, windows_silent_update_script())?;
+
+        let mut command = Command::new("powershell.exe");
+        apply_windows_command_flags(&mut command);
+        command
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&script_path)
+            .arg("-InstallerPath")
+            .arg(installer_path)
+            .arg("-ExpectedVersion")
+            .arg(&descriptor.version)
+            .arg("-WaitPid")
+            .arg(std::process::id().to_string())
+            .arg("-RestartExe")
+            .arg(&restart_executable)
+            .arg("-LogPath")
+            .arg(&log_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+            .spawn()
+            .with_context(|| "failed to launch Windows silent desktop app updater")?;
+
+        self.append_log(
+            "info",
+            "app",
+            &format!("已启动 Windows 静默更新安装器，日志：{}", log_path.to_string_lossy()),
+        );
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
     fn schedule_app_restart_for_update(&self) {
         let backend = self.clone();
         tauri::async_runtime::spawn(async move {
@@ -3982,7 +3997,6 @@ impl Backend {
     fn handle_fs_event(&self, event: Event) {
         let mut touched_state = false;
         let mut reload_logs = false;
-        let mut ingest_usage = false;
         for path in event.paths {
             let file_name = path
                 .file_name()
@@ -3999,16 +4013,9 @@ impl Backend {
             {
                 touched_state = true;
             }
-            if is_usage_log_file_name(file_name) {
-                ingest_usage = true;
-                touched_state = true;
-            }
         }
         if reload_logs {
             let _ = self.reload_logs_from_disk();
-        }
-        if ingest_usage {
-            let _ = self.ingest_usage_logs_to_store();
         }
         if touched_state {
             self.emit_state_changed();
@@ -8532,6 +8539,53 @@ xattr -dr com.apple.quarantine "$TARGET_APP" 2>/dev/null || true
 SUCCESS=1
 open "$TARGET_APP"
 rm -f "$0"
+"#
+}
+
+#[cfg(target_os = "windows")]
+fn windows_silent_update_script() -> &'static str {
+    r#"
+param(
+  [Parameter(Mandatory = $true)][string]$InstallerPath,
+  [Parameter(Mandatory = $true)][string]$ExpectedVersion,
+  [Parameter(Mandatory = $true)][int]$WaitPid,
+  [Parameter(Mandatory = $true)][string]$RestartExe,
+  [Parameter(Mandatory = $true)][string]$LogPath
+)
+
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+if ($LogPath) {
+  Start-Transcript -Path $LogPath -Force | Out-Null
+}
+
+try {
+  while (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue) {
+    Start-Sleep -Milliseconds 500
+  }
+
+  Start-Process -FilePath $InstallerPath -ArgumentList '/S' -Wait -WindowStyle Hidden
+
+  if ($ExpectedVersion) {
+    $file = Get-Item $RestartExe -ErrorAction Stop
+    $installedVersion = $file.VersionInfo.ProductVersion
+    if (-not $installedVersion) {
+      $installedVersion = $file.VersionInfo.FileVersion
+    }
+    if ($installedVersion -and ($installedVersion -ne $ExpectedVersion)) {
+      throw "Installed app version mismatch: expected $ExpectedVersion, got $installedVersion"
+    }
+  }
+
+  Start-Process -FilePath $RestartExe | Out-Null
+}
+finally {
+  if ($LogPath) {
+    Stop-Transcript | Out-Null
+  }
+  Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+}
 "#
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "lich13cpa-tauri"
-version = "0.1.4"
+version = "0.1.5"
 description = "Tauri 2 desktop shell for lich13CPA"
 authors = ["lich13"]
 license = ""
@@ -45,3 +45,4 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 url = "2.5"
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
+

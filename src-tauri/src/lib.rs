@@ -279,8 +279,6 @@ pub fn run() {
             commands::start_proxy,
             commands::stop_proxy,
             commands::sync_runtime_config,
-            commands::refresh_usage,
-            commands::get_usage_summary,
             commands::get_provider_auth_url,
             commands::check_provider_auth_status,
             commands::check_proxy_binary_update,

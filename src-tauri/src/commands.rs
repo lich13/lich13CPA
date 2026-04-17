@@ -41,19 +41,6 @@ pub async fn sync_runtime_config(backend: State<'_, Backend>) -> Result<Value, S
 }
 
 #[tauri::command]
-pub async fn refresh_usage(backend: State<'_, Backend>) -> Result<Value, String> {
-    backend.refresh_usage().await.map_err(map_error)
-}
-
-#[tauri::command]
-pub async fn get_usage_summary(
-    query: Option<Value>,
-    backend: State<'_, Backend>,
-) -> Result<Value, String> {
-    backend.get_usage_summary(query).await.map_err(map_error)
-}
-
-#[tauri::command]
 pub async fn get_provider_auth_url(
     provider: String,
     backend: State<'_, Backend>,
