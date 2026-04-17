@@ -273,12 +273,10 @@ export type ProviderAuthProvider =
   | 'openai'
   | 'codex'
   | 'gemini'
-  | 'qwen'
   | 'iflow'
   | 'vertex'
   | 'kiro'
   | 'antigravity'
-  | 'kimi'
   | 'copilot'
 
 export interface ProviderAuthLaunchResult {

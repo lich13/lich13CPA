@@ -261,20 +261,6 @@ const SUPPLIERS: SupplierMeta[] = [
     theme: 'gold',
   },
   {
-    id: 'kimi',
-    label: 'Kimi OAuth',
-    description: '点击 + 打开授权页',
-    openMode: 'oauth',
-    theme: 'sun',
-  },
-  {
-    id: 'qwen',
-    label: 'Qwen OAuth',
-    description: '点击 + 打开授权页',
-    openMode: 'oauth',
-    theme: 'orange',
-  },
-  {
     id: 'vertex',
     label: 'Vertex JSON 登录',
     description: '点击 + 打开 WebUI 的 OAuth 页',

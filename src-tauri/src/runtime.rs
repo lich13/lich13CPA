@@ -112,7 +112,6 @@ const PROVIDER_AUTH_ENDPOINTS: &[(&str, &str)] = &[
     ("openai", "/v0/management/codex-auth-url?is_webui=true"),
     ("codex", "/v0/management/codex-auth-url?is_webui=true"),
     ("gemini", "/v0/management/gemini-cli-auth-url?is_webui=true"),
-    ("qwen", "/v0/management/qwen-auth-url?is_webui=true"),
     ("iflow", "/v0/management/iflow-auth-url?is_webui=true"),
     (
         "antigravity",
