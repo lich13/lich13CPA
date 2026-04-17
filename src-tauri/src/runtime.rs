@@ -88,22 +88,15 @@ const GEMINI_CLI_QUOTA_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
 const GEMINI_CLI_CODE_ASSIST_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
-const KIMI_USAGE_URLS: &[&str] = &[
-    "https://api.kimi.com/coding/v1/usages",
-    "https://kimi.moonshot.cn/api/usage",
-];
-
 const PROVIDER_IMPORTS: &[(&str, &str)] = &[
     ("claude", "Claude"),
     ("openai", "OpenAI"),
     ("codex", "Codex"),
     ("gemini", "Gemini"),
-    ("qwen", "Qwen"),
     ("iflow", "iFlow"),
     ("vertex", "Vertex"),
     ("kiro", "Kiro"),
     ("antigravity", "Antigravity"),
-    ("kimi", "Kimi"),
     ("copilot", "Copilot"),
 ];
 
@@ -1279,15 +1272,6 @@ impl Backend {
             .unwrap_or_else(|error| {
                 generic_quota_summary(&record, &provider, &label, Some(error.to_string()))
             })
-        } else if provider == "kimi" {
-            let auth_index = normalized_string(record.get("authIndex"))
-                .ok_or_else(|| anyhow!("当前认证文件还未被管理端识别，请先启动代理并刷新状态。"))?;
-            let runtime = self.resolve_management_runtime()?;
-            self.build_kimi_quota_summary(&record, runtime.0, &runtime.1, &auth_index)
-                .await
-                .unwrap_or_else(|error| {
-                    generic_quota_summary(&record, &provider, &label, Some(error.to_string()))
-                })
         } else {
             generic_quota_summary(
                 &record,
@@ -4405,43 +4389,6 @@ impl Backend {
         ))
     }
 
-    async fn build_kimi_quota_summary(
-        &self,
-        record: &Value,
-        port: u16,
-        management_api_key: &str,
-        auth_index: &str,
-    ) -> Result<Value> {
-        let mut last_error = None::<String>;
-        for url in KIMI_USAGE_URLS {
-            let result = self
-                .post_management_api_call(
-                    port,
-                    management_api_key,
-                    &json!({
-                      "authIndex": auth_index,
-                      "method": "GET",
-                      "url": url,
-                      "header": kimi_request_headers(),
-                    }),
-                )
-                .await;
-            match result {
-                Ok(result) if (200..300).contains(&result.status_code) => {
-                    return Ok(build_kimi_quota_summary(
-                        record,
-                        &parse_management_api_body(&result.body),
-                    ))
-                }
-                Ok(result) => last_error = Some(get_api_call_error_message(&result)),
-                Err(error) => last_error = Some(error.to_string()),
-            }
-        }
-        Err(anyhow!(
-            "{}",
-            last_error.unwrap_or_else(|| "未获取到可用额度数据。".to_string())
-        ))
-    }
 }
 
 fn resolve_paths(app: &AppHandle) -> ResolvedPaths {
@@ -6964,67 +6911,6 @@ fn build_antigravity_quota_summary(record: &Value, payload: &Value, project_id: 
     summary
 }
 
-fn build_kimi_quota_summary(record: &Value, payload: &Value) -> Value {
-    let mut summary = generic_quota_summary(record, "kimi", "Kimi", None);
-    let mut items = Vec::new();
-    if let Some(usage) = payload.get("usage") {
-        if let Some(item) = build_kimi_quota_item("summary", "总额度", usage) {
-            items.push(item);
-        }
-    }
-    for (index, limit) in array(payload.get("limits")).iter().enumerate() {
-        let detail = if limit.get("detail").map(Value::is_object).unwrap_or(false) {
-            limit.get("detail").unwrap()
-        } else {
-            limit
-        };
-        let label = normalized_string(limit.get("name"))
-            .or_else(|| normalized_string(detail.get("name")))
-            .or_else(|| normalized_string(limit.get("title")))
-            .or_else(|| normalized_string(detail.get("title")))
-            .unwrap_or_else(|| format!("额度 {}", index + 1));
-        if let Some(item) = build_kimi_quota_item(&format!("limit-{}", index + 1), &label, detail) {
-            items.push(item);
-        }
-    }
-    summary["items"] = Value::Array(items);
-    summary
-}
-
-fn build_kimi_quota_item(id: &str, label: &str, data: &Value) -> Option<Value> {
-    let limit = normalized_number(data.get("limit"));
-    let used = normalized_number(data.get("used")).or_else(|| {
-        let remaining = normalized_number(data.get("remaining"))?;
-        Some(limit.unwrap_or(remaining) - remaining)
-    });
-    if limit.is_none() && used.is_none() {
-        return None;
-    }
-    let remaining_percent = match (limit, used) {
-        (Some(limit), Some(used)) if limit > 0.0 => {
-            Some(((limit - used) / limit * 100.0).round().clamp(0.0, 100.0))
-        }
-        (Some(_), Some(_)) => Some(0.0),
-        _ => None,
-    };
-    let (reset_at, reset_text) = kimi_reset_info(data);
-    Some(build_quota_item(
-        id,
-        label,
-        remaining_percent,
-        reset_at,
-        reset_text,
-        match (used, limit) {
-            (Some(used), Some(limit)) => Some(format!(
-                "{} / {}",
-                used.round() as i64,
-                limit.round() as i64
-            )),
-            _ => None,
-        },
-    ))
-}
-
 fn build_quota_item(
     id: &str,
     label: &str,
@@ -7280,52 +7166,6 @@ fn quota_reset_info_from_string(value: Option<String>) -> (Option<String>, Optio
     (reset_at, reset_text)
 }
 
-fn format_relative_reset_hint(seconds: i64) -> Option<String> {
-    if seconds <= 0 {
-        return Some("即将重置".to_string());
-    }
-
-    let total_minutes = ((seconds + 59) / 60).max(1);
-    let days = total_minutes / (24 * 60);
-    let hours = (total_minutes % (24 * 60)) / 60;
-    let minutes = total_minutes % 60;
-    let mut parts = Vec::new();
-
-    if days > 0 {
-        parts.push(format!("{days}天"));
-    }
-    if hours > 0 {
-        parts.push(format!("{hours}小时"));
-    }
-    if minutes > 0 && parts.len() < 2 {
-        parts.push(format!("{minutes}分钟"));
-    }
-    if parts.is_empty() {
-        parts.push("不到1分钟".to_string());
-    }
-
-    Some(format!("还剩 {}", parts.join("")))
-}
-
-fn kimi_reset_info(data: &Value) -> (Option<String>, Option<String>) {
-    for key in ["reset_at", "resetAt", "reset_time", "resetTime"] {
-        let (reset_at, reset_text) = quota_reset_info_from_value(data.get(key));
-        if reset_at.is_some() || reset_text.is_some() {
-            return (reset_at, reset_text);
-        }
-    }
-    let relative = normalized_number(
-        data.get("reset_in")
-            .or_else(|| data.get("resetIn"))
-            .or_else(|| data.get("ttl")),
-    );
-    let seconds = relative.map(|value| value as i64).unwrap_or_default();
-    (
-        quota_reset_at_after_seconds(seconds),
-        format_relative_reset_hint(seconds),
-    )
-}
-
 fn resolve_claude_plan_type_from_profile(profile: &Value) -> Option<String> {
     let account = object(profile.get("account"));
     let has_max = normalize_flag_value(account.get("has_claude_max"));
@@ -7394,10 +7234,6 @@ fn antigravity_request_headers() -> HashMap<String, String> {
     ])
 }
 
-fn kimi_request_headers() -> HashMap<String, String> {
-    HashMap::new()
-}
-
 fn detect_provider_from_file_name(file_name: &str) -> String {
     let normalized = file_name.to_lowercase();
     for (needle, provider) in [
@@ -7408,9 +7244,7 @@ fn detect_provider_from_file_name(file_name: &str) -> String {
         ("gpt", "openai"),
         ("claude", "claude"),
         ("vertex", "vertex"),
-        ("qwen", "qwen"),
         ("iflow", "iflow"),
-        ("kimi", "kimi"),
         ("kiro", "kiro"),
         ("copilot", "copilot"),
         ("antigravity", "antigravity"),
@@ -7452,9 +7286,7 @@ fn normalize_auth_provider_hint(value: Option<&Value>) -> Option<String> {
         ("chatgpt", "openai"),
         ("gemini", "gemini"),
         ("vertex", "vertex"),
-        ("qwen", "qwen"),
         ("iflow", "iflow"),
-        ("kimi", "kimi"),
         ("kiro", "kiro"),
         ("copilot", "copilot"),
         ("antigravity", "antigravity"),
@@ -7720,14 +7552,6 @@ mod tests {
 
         assert_eq!(reset_text, None);
         assert_eq!(reset_at.as_deref(), Some("2026-04-17T00:00:00+00:00"));
-    }
-
-    #[test]
-    fn kimi_reset_info_converts_relative_seconds_to_absolute_reset_at() {
-        let (reset_at, reset_text) = kimi_reset_info(&json!({ "reset_in": 5400 }));
-
-        assert!(reset_at.is_some());
-        assert_eq!(reset_text.as_deref(), Some("还剩 1小时30分钟"));
     }
 
     #[test]
@@ -8087,9 +7911,6 @@ fn resolve_quota_provider(record: &Value) -> Option<String> {
     }
     if candidates.iter().any(|value| value.contains("gemini")) {
         return Some("gemini".to_string());
-    }
-    if candidates.iter().any(|value| value.contains("kimi")) {
-        return Some("kimi".to_string());
     }
     None
 }

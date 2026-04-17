@@ -131,7 +131,6 @@ interface ProviderSectionMeta {
 }
 
 interface SupplierMeta {
-  description: string
   id: ProviderAuthProvider
   label: string
   openMode: 'oauth' | 'manual'
@@ -234,7 +233,6 @@ const SUPPLIERS: SupplierMeta[] = [
   {
     id: 'codex',
     label: 'Codex OAuth',
-    description: '点击 + 打开授权页',
     openMode: 'oauth',
     theme: 'sun',
     summaryIds: ['codex', 'openai'],
@@ -242,35 +240,30 @@ const SUPPLIERS: SupplierMeta[] = [
   {
     id: 'claude',
     label: 'Anthropic OAuth',
-    description: '点击 + 打开授权页',
     openMode: 'oauth',
     theme: 'orange',
   },
   {
     id: 'antigravity',
     label: 'Antigravity OAuth',
-    description: '点击 + 打开授权页',
     openMode: 'oauth',
     theme: 'red',
   },
   {
     id: 'gemini',
     label: 'Gemini CLI OAuth',
-    description: '点击 + 打开授权页',
     openMode: 'oauth',
     theme: 'gold',
   },
   {
     id: 'vertex',
     label: 'Vertex JSON 登录',
-    description: '点击 + 打开 WebUI 的 OAuth 页',
     openMode: 'manual',
     theme: 'gold',
   },
   {
     id: 'iflow',
     label: 'iFlow Cookie 登录',
-    description: '点击 + 打开 WebUI 的 OAuth 页',
     openMode: 'manual',
     theme: 'red',
   },
@@ -1414,7 +1407,6 @@ function canFetchQuota(file: AuthFileRecord): boolean {
     provider === 'claude' ||
     provider === 'gemini' ||
     provider === 'antigravity' ||
-    provider === 'kimi' ||
     type === 'codex' ||
     type === 'gemini-cli' ||
     type === 'antigravity'
@@ -2215,14 +2207,6 @@ async function loadState() {
 
   function renderDashboard() {
     const featuredQuotaFiles = getFeaturedQuotaFiles(state.authFiles)
-    const enabledFiles = state.authFiles.filter((file) => file.enabled).length
-    const quotaReadyFiles = state.authFiles.filter(
-      (file) => canFetchQuota(file) && !file.unavailable,
-    ).length
-    const activeProviders = state.providerImports.filter((entry) => entry.totalCount > 0).length
-    const latestAuthChange = [...state.authFiles]
-      .map((file) => getDateRank(file.modifiedAt, file.updatedAt, file.createdAt))
-      .sort((left, right) => right - left)[0]
     const importSummaries = state.providerImports
       .filter((entry) => entry.totalCount > 0)
       .slice(0, 6)
@@ -2382,21 +2366,6 @@ async function loadState() {
             ) : null}
           </article>
 
-          <article className="metric-card">
-            <span className="metric-label">认证概览</span>
-            <strong>{formatCount(state.authFiles.length)}</strong>
-            <span className="metric-help">
-              启用 {formatCount(enabledFiles)} · 可读额度 {formatCount(quotaReadyFiles)}
-            </span>
-            <div className="metric-pairs metric-pairs-compact">
-              <span>覆盖提供商 {formatCount(activeProviders)}</span>
-              <span>
-                {latestAuthChange
-                  ? `最近更新 ${formatTime(new Date(latestAuthChange).toISOString())}`
-                  : '暂无更新时间'}
-              </span>
-            </div>
-          </article>
         </section>
 
         <section className="dashboard-grid dashboard-grid-compact">
@@ -2404,7 +2373,6 @@ async function loadState() {
             <div className="section-head">
               <div>
                 <h2>认证额度</h2>
-                <p>优先展示启用中的关键额度，并保留一键刷新入口。</p>
               </div>
               <div className="action-row">
                 <button
@@ -2524,7 +2492,6 @@ async function loadState() {
             <div className="section-head">
               <div>
                 <h2>快捷授权</h2>
-                <p>保留高频导入和 OAuth 入口，整体布局更紧凑。</p>
               </div>
             </div>
 
@@ -2569,7 +2536,6 @@ async function loadState() {
                     <div className="supplier-head">
                       <div>
                         <strong>{supplier.label}</strong>
-                        <span>{supplier.description}</span>
                       </div>
                       <div className="supplier-card-actions">
                         <button
@@ -3828,7 +3794,6 @@ async function loadState() {
           <div className="section-head auth-files-head">
             <div>
               <h2>认证文件</h2>
-              <p>按原仓库的数据结构展示，本地文件为主，远端状态只做补充合并。</p>
             </div>
             <div className="action-row">
               <button
@@ -4064,7 +4029,6 @@ async function loadState() {
           <div className="section-head">
             <div>
               <h2>基础设置</h2>
-              <p>同路径保存 `proxy-config.yaml`、`gui-state.json`、`cli-proxy-api / cli-proxy-api.exe`，认证文件单独保存在 `auth-files` 子目录。</p>
             </div>
             <button
               className="primary-button"
