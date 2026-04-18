@@ -391,31 +391,30 @@
   grid-template-columns: minmax(0, 1fr) minmax(320px, 430px);
 }
 
-.dashboard-grid {
-  grid-template-columns: minmax(0, 1.08fr) minmax(300px, 0.92fr);
-  gap: 12px;
-}
-
-.dashboard-metrics-grid {
-  grid-template-columns: repeat(9, minmax(0, 1fr));
-  gap: 12px;
-}
-
-.dashboard-metrics-grid > .metric-card {
-  grid-column: span 2;
-  min-height: 188px;
-  padding: 16px;
-}
-
-.dashboard-metrics-grid > .metric-card.metric-card-wide {
-  grid-column: span 3;
-}
-
-.dashboard-grid-compact {
+.dashboard-fixed-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.02fr) minmax(420px, 0.98fr);
+  gap: 14px;
   align-items: start;
 }
 
-.dashboard-section {
+.dashboard-left-column,
+.dashboard-right-column {
+  display: grid;
+  gap: 14px;
+}
+
+.dashboard-control-card,
+.dashboard-right-section {
+  height: auto;
+}
+
+.dashboard-control-card {
+  padding: 16px;
+  min-height: 164px;
+}
+
+.dashboard-right-section {
   align-content: start;
 }
 
@@ -461,6 +460,10 @@
 
 .supplier-card-actions {
   justify-content: flex-end;
+}
+
+.supplier-head {
+  align-items: flex-start;
 }
 
 .supplier-import-button {
@@ -1354,76 +1357,6 @@
   row-gap: 8px;
 }
 
-.usage-pricing-header-grid {
-  grid-template-columns: minmax(180px, 240px) minmax(0, 1fr);
-  align-items: stretch;
-}
-
-.usage-pricing-summary-card {
-  display: grid;
-  gap: 8px;
-  padding: 14px 16px;
-  border-radius: 18px;
-  background: rgba(42, 23, 18, 0.66);
-  color: #ffe4c7;
-}
-
-.usage-pricing-summary-card strong {
-  font-size: 1.5rem;
-  color: #fff6ec;
-}
-
-.usage-pricing-breakdown {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px 16px;
-  color: #d7ac88;
-  font-size: 0.9rem;
-}
-
-.usage-pricing-rule-list {
-  display: grid;
-  gap: 14px;
-}
-
-.usage-pricing-rule-card {
-  display: grid;
-  gap: 12px;
-  padding: 14px 16px;
-  border-radius: 18px;
-  background: rgba(42, 23, 18, 0.66);
-}
-
-.usage-pricing-rule-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.usage-pricing-rule-head strong {
-  color: #fff0e1;
-}
-
-.usage-pricing-rule-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.usage-pricing-reference-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-}
-
-.usage-pricing-match {
-  color: #d7ac88;
-  font-size: 0.85rem;
-}
-
-.usage-pricing-match.unmatched {
-  color: #ffb48a;
-}
-
 .dashboard-action-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1514,36 +1447,25 @@
 @media (max-width: 1100px) {
   .app-shell,
   .content-grid.split,
-  .dashboard-grid,
+  .dashboard-fixed-layout,
   .metrics-grid,
   .auth-metric-grid,
   .auth-detail-list,
-  .usage-page-grid,
-  .usage-trend-grid,
   .form-grid.two-columns,
   .detail-grid,
   .meta-grid {
     grid-template-columns: 1fr;
   }
 
-  .usage-snapshot-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .usage-pricing-header-grid,
-  .usage-pricing-rule-grid,
   .dashboard-action-grid,
   .metric-action-grid,
   .auth-file-simple-grid,
   .auth-files-summary-grid,
   .dashboard-import-summary-list,
   .supplier-grid,
-  .dashboard-metrics-grid {
+  .dashboard-left-column,
+  .dashboard-right-column {
     grid-template-columns: 1fr;
-  }
-
-  .metric-card-wide {
-    grid-column: auto;
   }
 
   .auth-card-path {
@@ -1573,10 +1495,6 @@
     position: sticky;
     top: 0;
   }
-
-  .usage-range-meta .primary-button {
-    margin-left: 0;
-  }
 }
 
 @media (max-width: 1450px) {
@@ -1584,13 +1502,8 @@
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
-  .dashboard-metrics-grid {
-    grid-template-columns: repeat(6, minmax(0, 1fr));
-  }
-
-  .dashboard-metrics-grid > .metric-card,
-  .dashboard-metrics-grid > .metric-card.metric-card-wide {
-    grid-column: span 3;
+  .dashboard-fixed-layout {
+    grid-template-columns: minmax(0, 1fr) minmax(380px, 0.92fr);
   }
 
   .dashboard-action-grid-compact {
@@ -1603,16 +1516,12 @@
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
-  .dashboard-grid {
+  .dashboard-fixed-layout {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .dashboard-metrics-grid {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-  }
-
-  .dashboard-metrics-grid > .metric-card,
-  .dashboard-metrics-grid > .metric-card.metric-card-wide {
-    grid-column: span 2;
+  .dashboard-left-column,
+  .dashboard-right-column {
+    grid-template-rows: none;
   }
 }

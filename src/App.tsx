@@ -40,17 +40,8 @@ import type {
   SaveAiProviderInput,
   SaveKnownSettingsInput,
   SidecarChannel,
-  UsagePoint,
-  UsageModelSummary,
-  UsagePricingConfig,
-  UsagePricingRule,
-  UsagePricingSourceLink,
-  UsageSummary,
-  UsageSummaryQuery,
-  UsageSummaryQueryPreset,
 } from '../shared/types'
 import './App.css'
-import { USAGE_PRICING_DEFAULTS, USAGE_PRICING_REFERENCE_LINKS } from './generated/usagePricingDefaults'
 
 const APP_ICON_SRC = 'app-icon.png'
 
@@ -58,25 +49,6 @@ type Notice = { kind: 'success' | 'error'; text: string }
 type QuotaState = { error: string | null; loading: boolean; summary: AuthFileQuotaSummary | null }
 type KeyProviderKind = 'gemini' | 'codex' | 'claude' | 'vertex'
 type ProviderEditorKind = KeyProviderKind | 'openai-compatibility' | 'ampcode'
-type UsageCustomRangeDraft = { endAt: string; startAt: string }
-type UsagePricedModelSummary = UsageModelSummary & {
-  cacheWriteCost: number
-  cacheReadCost: number
-  estimatedCost: number
-  inputCost: number
-  matchedRuleId: string | null
-  matchedRuleName: string | null
-  outputCost: number
-}
-type UsagePricingComputation = {
-  cacheReadCost: number
-  cacheWriteCost: number
-  estimatedCost: number
-  inputCost: number
-  outputCost: number
-  pricedModels: UsagePricedModelSummary[]
-  unmatchedModels: string[]
-}
 
 type KeyProviderEditorState = {
   apiKey: string
@@ -181,10 +153,6 @@ const DEFAULT_MAX_RETRY_INTERVAL = 30
 const DEFAULT_STREAM_KEEPALIVE_SECONDS = 20
 const DEFAULT_STREAM_BOOTSTRAP_RETRIES = 2
 const DEFAULT_NON_STREAM_KEEPALIVE_INTERVAL_SECONDS = 15
-const DEFAULT_USAGE_PRESET: UsageSummaryQueryPreset = '7d'
-const USAGE_PRICING_STORAGE_KEY = 'lich13cpa:usage-pricing'
-const DEFAULT_USAGE_CURRENCY = '¤'
-const PRICING_REFERENCE_LINKS: UsagePricingSourceLink[] = USAGE_PRICING_REFERENCE_LINKS
 
 function getSidecarDisplayName(channel: SidecarChannel): string {
   return channel === 'plus' ? 'CLIProxyAPIPlus' : 'CLIProxyAPI'
@@ -209,8 +177,6 @@ const EMPTY_SETTINGS: SaveKnownSettingsInput = {
   autoStartProxyOnLaunch: true,
   minimizeToTrayOnClose: true,
 }
-const DEFAULT_USAGE_PRICING_RULE_MAP = new Map(USAGE_PRICING_DEFAULTS.rules.map((rule) => [rule.id, rule]))
-const DEFAULT_USAGE_PRICING_RULE_ID_SET = new Set(DEFAULT_USAGE_PRICING_RULE_MAP.keys())
 
 const PAGES: PageMeta[] = [
   { id: 'dashboard', label: '仪表盘', icon: LayoutDashboard },
@@ -406,428 +372,6 @@ function formatPercent(value: number | null | undefined): string {
 
   return `${Math.round(Math.max(0, Math.min(100, value)))}%`
 }
-
-function formatMoney(value: number, currency = DEFAULT_USAGE_CURRENCY): string {
-  if (!Number.isFinite(value)) {
-    return `${currency}--`
-  }
-
-  const digits = value >= 100 ? 2 : value >= 1 ? 4 : 6
-  return `${currency}${value.toFixed(digits)}`
-}
-
-function normalizePricingNumber(value: number): number {
-  if (!Number.isFinite(value) || value < 0) {
-    return 0
-  }
-
-  return value
-}
-
-function createPricingRule(nextId: number): UsagePricingRule {
-  return {
-    id: `custom-${nextId}`,
-    enabled: true,
-    name: `自定义规则 ${nextId}`,
-    modelPattern: '',
-    reasoningEffortPattern: '*',
-    inputPricePerMillion: 0,
-    outputPricePerMillion: 0,
-    cacheReadPricePerMillion: 0,
-    cacheWritePricePerMillion: 0,
-    multiplier: 1,
-    sourceUrl: '',
-    notes: '',
-  }
-}
-
-function cloneUsagePricingRule(rule: UsagePricingRule): UsagePricingRule {
-  return { ...rule }
-}
-
-function getDefaultUsagePricingConfig(): UsagePricingConfig {
-  return {
-    currency: USAGE_PRICING_DEFAULTS.currency || DEFAULT_USAGE_CURRENCY,
-    defaultsUpdatedAt: USAGE_PRICING_DEFAULTS.defaultsUpdatedAt ?? null,
-    removedRuleIds: [],
-    rules: USAGE_PRICING_DEFAULTS.rules.map(cloneUsagePricingRule),
-    syncWarnings: [...(USAGE_PRICING_DEFAULTS.syncWarnings ?? [])],
-  }
-}
-
-function claimUsagePricingRuleId(candidate: string, seenRuleIds: Set<string>, fallbackId: string): string {
-  const normalizedCandidate = candidate.trim() || fallbackId
-
-  if (!seenRuleIds.has(normalizedCandidate)) {
-    seenRuleIds.add(normalizedCandidate)
-    return normalizedCandidate
-  }
-
-  let suffix = 2
-
-  while (seenRuleIds.has(`${normalizedCandidate}-${suffix}`)) {
-    suffix += 1
-  }
-
-  const nextId = `${normalizedCandidate}-${suffix}`
-  seenRuleIds.add(nextId)
-  return nextId
-}
-
-function getNextCustomPricingRuleNumber(rules: UsagePricingRule[]): number {
-  return (
-    rules.reduce((maxValue, rule) => {
-      const matched = rule.id.match(/^custom-(\d+)$/)
-      const value = matched ? Number(matched[1]) : 0
-      return Number.isFinite(value) ? Math.max(maxValue, value) : maxValue
-    }, 0) + 1
-  )
-}
-
-function normalizeUsagePricingRule(
-  rawRule: Partial<UsagePricingRule>,
-  fallbackRule: UsagePricingRule,
-  ruleId: string,
-): UsagePricingRule {
-  return {
-    ...fallbackRule,
-    ...rawRule,
-    id: ruleId,
-    name: typeof rawRule.name === 'string' ? rawRule.name : fallbackRule.name,
-    modelPattern: typeof rawRule.modelPattern === 'string' ? rawRule.modelPattern : fallbackRule.modelPattern,
-    reasoningEffortPattern:
-      typeof rawRule.reasoningEffortPattern === 'string' && rawRule.reasoningEffortPattern.trim()
-        ? rawRule.reasoningEffortPattern
-        : fallbackRule.reasoningEffortPattern,
-    sourceUrl: typeof rawRule.sourceUrl === 'string' ? rawRule.sourceUrl : fallbackRule.sourceUrl,
-    notes: typeof rawRule.notes === 'string' ? rawRule.notes : fallbackRule.notes,
-    enabled: rawRule.enabled !== false,
-    inputPricePerMillion: normalizePricingNumber(Number(rawRule.inputPricePerMillion ?? fallbackRule.inputPricePerMillion)),
-    outputPricePerMillion: normalizePricingNumber(Number(rawRule.outputPricePerMillion ?? fallbackRule.outputPricePerMillion)),
-    cacheReadPricePerMillion: normalizePricingNumber(
-      Number(rawRule.cacheReadPricePerMillion ?? fallbackRule.cacheReadPricePerMillion),
-    ),
-    cacheWritePricePerMillion: normalizePricingNumber(
-      Number(rawRule.cacheWritePricePerMillion ?? fallbackRule.cacheWritePricePerMillion),
-    ),
-    multiplier: normalizePricingNumber(Number(rawRule.multiplier ?? fallbackRule.multiplier)) || 1,
-  }
-}
-
-function loadUsagePricingConfig(): UsagePricingConfig {
-  const defaults = getDefaultUsagePricingConfig()
-
-  if (typeof window === 'undefined' || !window.localStorage) {
-    return defaults
-  }
-
-  try {
-    const raw = window.localStorage.getItem(USAGE_PRICING_STORAGE_KEY)
-
-    if (!raw) {
-      return defaults
-    }
-
-    const parsed = JSON.parse(raw) as Partial<UsagePricingConfig>
-    const removedRuleIds = Array.isArray(parsed.removedRuleIds)
-      ? parsed.removedRuleIds.filter(
-          (item): item is string => typeof item === 'string' && DEFAULT_USAGE_PRICING_RULE_ID_SET.has(item),
-        )
-      : []
-    const defaultRuleOverrides = new Map<string, UsagePricingRule>()
-    const customRules: UsagePricingRule[] = []
-    const seenRuleIds = new Set(defaults.rules.map((rule) => rule.id))
-    let nextCustomRuleNumber = getNextCustomPricingRuleNumber(defaults.rules)
-
-    if (Array.isArray(parsed.rules)) {
-      for (const candidate of parsed.rules) {
-        if (!candidate || typeof candidate !== 'object') {
-          continue
-        }
-
-        const rawRule = candidate as Partial<UsagePricingRule>
-        const rawRuleId = typeof rawRule.id === 'string' ? rawRule.id.trim() : ''
-
-        if (rawRuleId && DEFAULT_USAGE_PRICING_RULE_ID_SET.has(rawRuleId)) {
-          const fallbackRule = DEFAULT_USAGE_PRICING_RULE_MAP.get(rawRuleId)
-
-          if (fallbackRule) {
-            defaultRuleOverrides.set(rawRuleId, normalizeUsagePricingRule(rawRule, fallbackRule, rawRuleId))
-          }
-
-          continue
-        }
-
-        const fallbackRule = createPricingRule(nextCustomRuleNumber)
-        const ruleId = claimUsagePricingRuleId(rawRuleId || fallbackRule.id, seenRuleIds, fallbackRule.id)
-        customRules.push(normalizeUsagePricingRule(rawRule, fallbackRule, ruleId))
-        nextCustomRuleNumber += 1
-      }
-    }
-
-    const rules = [
-      ...defaults.rules
-        .filter((rule) => !removedRuleIds.includes(rule.id))
-        .map((rule) => cloneUsagePricingRule(defaultRuleOverrides.get(rule.id) ?? rule)),
-      ...customRules,
-    ]
-
-    return {
-      currency:
-        typeof parsed.currency === 'string' && parsed.currency.trim()
-          ? parsed.currency
-          : defaults.currency,
-      defaultsUpdatedAt: defaults.defaultsUpdatedAt ?? null,
-      removedRuleIds,
-      rules,
-      syncWarnings: [...(defaults.syncWarnings ?? [])],
-    }
-  } catch {
-    return defaults
-  }
-}
-
-function splitPatterns(value: string): string[] {
-  return value
-    .split(/[\n,]+/)
-    .map((item) => item.trim().toLowerCase())
-    .filter(Boolean)
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
-function wildcardMatch(pattern: string, candidate: string): boolean {
-  if (!pattern || pattern === '*') {
-    return true
-  }
-
-  const regex = new RegExp(`^${escapeRegExp(pattern).replace(/\\\*/g, '.*')}$`, 'i')
-  return regex.test(candidate)
-}
-
-function matchUsagePricingRule(model: string, rules: UsagePricingRule[]): UsagePricingRule | null {
-  const normalizedModel = model.trim().toLowerCase()
-
-  for (const rule of rules) {
-    if (!rule.enabled) {
-      continue
-    }
-
-    const patterns = splitPatterns(rule.modelPattern)
-
-    if (patterns.length === 0) {
-      continue
-    }
-
-    if (patterns.some((pattern) => wildcardMatch(pattern, normalizedModel))) {
-      return rule
-    }
-  }
-
-  return null
-}
-
-function ruleMatchesModel(rule: UsagePricingRule, model: string): boolean {
-  if (!rule.enabled) {
-    return false
-  }
-
-  const normalizedModel = model.trim().toLowerCase()
-  const patterns = splitPatterns(rule.modelPattern)
-
-  if (patterns.length === 0) {
-    return false
-  }
-
-  return patterns.some((pattern) => wildcardMatch(pattern, normalizedModel))
-}
-
-function computeUsagePricing(
-  summary: UsageSummary | null,
-  pricingConfig: UsagePricingConfig,
-): UsagePricingComputation {
-  if (!summary) {
-    return {
-      cacheReadCost: 0,
-      cacheWriteCost: 0,
-      estimatedCost: 0,
-      inputCost: 0,
-      outputCost: 0,
-      pricedModels: [],
-      unmatchedModels: [],
-    }
-  }
-
-  let inputCost = 0
-  let outputCost = 0
-  let cacheReadCost = 0
-  let cacheWriteCost = 0
-  const unmatchedModels: string[] = []
-  const pricedModels = summary.topModels.map((item) => {
-    const rule = matchUsagePricingRule(item.model, pricingConfig.rules)
-
-    if (!rule) {
-      unmatchedModels.push(item.model)
-      return {
-        ...item,
-        cacheReadCost: 0,
-        cacheWriteCost: 0,
-        estimatedCost: 0,
-        inputCost: 0,
-        matchedRuleId: null,
-        matchedRuleName: null,
-        outputCost: 0,
-      }
-    }
-
-    const multiplier = normalizePricingNumber(rule.multiplier) || 1
-    const billableInputTokens = Math.max(
-      0,
-      Number.isFinite(item.billableInputTokens) ? item.billableInputTokens : item.inputTokens - item.cachedTokens,
-    )
-    const nextInputCost =
-      (billableInputTokens / 1_000_000) * normalizePricingNumber(rule.inputPricePerMillion) * multiplier
-    const nextOutputCost = (item.outputTokens / 1_000_000) * normalizePricingNumber(rule.outputPricePerMillion) * multiplier
-    const nextCacheReadCost = (item.cachedTokens / 1_000_000) * normalizePricingNumber(rule.cacheReadPricePerMillion) * multiplier
-    const nextCacheWriteCost = (item.cacheCreationTokens / 1_000_000) * normalizePricingNumber(rule.cacheWritePricePerMillion) * multiplier
-
-    inputCost += nextInputCost
-    outputCost += nextOutputCost
-    cacheReadCost += nextCacheReadCost
-    cacheWriteCost += nextCacheWriteCost
-
-    return {
-      ...item,
-      cacheReadCost: nextCacheReadCost,
-      cacheWriteCost: nextCacheWriteCost,
-      estimatedCost: nextInputCost + nextOutputCost + nextCacheReadCost + nextCacheWriteCost,
-      inputCost: nextInputCost,
-      matchedRuleId: rule.id,
-      matchedRuleName: rule.name,
-      outputCost: nextOutputCost,
-    }
-  })
-
-  return {
-    cacheReadCost,
-    cacheWriteCost,
-    estimatedCost: inputCost + outputCost + cacheReadCost + cacheWriteCost,
-    inputCost,
-    outputCost,
-    pricedModels: pricedModels.sort((left, right) => right.estimatedCost - left.estimatedCost),
-    unmatchedModels,
-  }
-}
-
-function collectPreferredPricingModels(state: DesktopAppState | null): string[] {
-  if (!state) {
-    return []
-  }
-
-  const names = new Set<string>()
-  const appendModel = (value: string | null | undefined) => {
-    const normalized = value?.trim().toLowerCase()
-
-    if (normalized) {
-      names.add(normalized)
-    }
-  }
-  const appendMappings = (models: ProviderModelMapping[]) => {
-    for (const model of models) {
-      appendModel(model.name)
-      appendModel(model.alias)
-    }
-  }
-
-  for (const provider of state.providers) {
-    appendMappings(provider.models)
-  }
-
-  for (const provider of state.aiProviders.gemini) {
-    appendMappings(provider.models)
-  }
-
-  for (const provider of state.aiProviders.codex) {
-    appendMappings(provider.models)
-  }
-
-  for (const provider of state.aiProviders.claude) {
-    appendMappings(provider.models)
-  }
-
-  for (const provider of state.aiProviders.vertex) {
-    appendMappings(provider.models)
-  }
-
-  for (const provider of state.aiProviders.openaiCompatibility) {
-    appendMappings(provider.models)
-  }
-
-  return [...names]
-}
-
-function getOrderedUsagePricingRules(
-  rules: UsagePricingRule[],
-  summary: UsageSummary | null,
-  preferredModels: string[],
-): UsagePricingRule[] {
-  const usageModels = summary?.topModels ?? []
-
-  return rules
-    .map((rule, index) => {
-      const matchedUsageModels = usageModels.filter((item) => ruleMatchesModel(rule, item.model))
-      const matchedPreferredModels = preferredModels.filter((model) => ruleMatchesModel(rule, model))
-
-      return {
-        index,
-        rule,
-        matchedPreferredCount: matchedPreferredModels.length,
-        matchedUsageRequests: matchedUsageModels.reduce((sum, item) => sum + item.requests, 0),
-        matchedUsageTokens: matchedUsageModels.reduce((sum, item) => sum + item.totalTokens, 0),
-        hasPreferredMatch: matchedPreferredModels.length > 0,
-        hasUsageMatch: matchedUsageModels.some((item) => item.requests > 0 || item.totalTokens > 0),
-      }
-    })
-    .sort((left, right) => {
-      if (left.hasUsageMatch !== right.hasUsageMatch) {
-        return left.hasUsageMatch ? -1 : 1
-      }
-
-      if (left.matchedUsageRequests !== right.matchedUsageRequests) {
-        return right.matchedUsageRequests - left.matchedUsageRequests
-      }
-
-      if (left.matchedUsageTokens !== right.matchedUsageTokens) {
-        return right.matchedUsageTokens - left.matchedUsageTokens
-      }
-
-      if (left.hasPreferredMatch !== right.hasPreferredMatch) {
-        return left.hasPreferredMatch ? -1 : 1
-      }
-
-      if (left.matchedPreferredCount !== right.matchedPreferredCount) {
-        return right.matchedPreferredCount - left.matchedPreferredCount
-      }
-
-      return left.index - right.index
-    })
-    .map((entry) => entry.rule)
-}
-
-function formatCompactCount(value: number): string {
-  if (value >= 1_000_000) {
-    return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}M`
-  }
-
-  if (value >= 1_000) {
-    return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}K`
-  }
-
-  return formatCount(value)
-}
-
 function formatPlanLabel(value: string | null | undefined): string | null {
   if (!value) {
     return null
@@ -845,65 +389,6 @@ function formatPlanLabel(value: string | null | undefined): string | null {
     default:
       return value
   }
-}
-
-function formatRate(numerator: number, denominator: number): string {
-  if (denominator <= 0) {
-    return '--'
-  }
-
-  return formatPercent((numerator / denominator) * 100)
-}
-
-function toDateTimeLocalValue(value: Date): string {
-  const year = value.getFullYear()
-  const month = `${value.getMonth() + 1}`.padStart(2, '0')
-  const day = `${value.getDate()}`.padStart(2, '0')
-  const hour = `${value.getHours()}`.padStart(2, '0')
-  const minute = `${value.getMinutes()}`.padStart(2, '0')
-  return `${year}-${month}-${day}T${hour}:${minute}`
-}
-
-function createDefaultUsageCustomRange(): UsageCustomRangeDraft {
-  const end = new Date()
-  const start = new Date(end)
-  start.setHours(0, 0, 0, 0)
-
-  return {
-    startAt: toDateTimeLocalValue(start),
-    endAt: toDateTimeLocalValue(end),
-  }
-}
-
-function toIsoDateTime(value: string): string | null {
-  const normalized = value.trim()
-
-  if (!normalized) {
-    return null
-  }
-
-  const parsed = new Date(normalized)
-  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString()
-}
-
-function getUsageQueryRangeText(summary: UsageSummary | null): string {
-  if (!summary) {
-    return '未查询'
-  }
-
-  if (summary.rangeStartAt && summary.rangeEndAt) {
-    return `${formatTime(summary.rangeStartAt)} - ${formatTime(summary.rangeEndAt)}`
-  }
-
-  if (summary.rangeStartAt) {
-    return `从 ${formatTime(summary.rangeStartAt)} 开始`
-  }
-
-  if (summary.rangeEndAt) {
-    return `截至 ${formatTime(summary.rangeEndAt)}`
-  }
-
-  return '覆盖全部已记录请求'
 }
 
 function getQuotaItemById(summary: AuthFileQuotaSummary, ...itemIds: string[]): AuthFileQuotaItem | null {
@@ -1435,21 +920,6 @@ function getSettingsFromState(state: DesktopAppState): SaveKnownSettingsInput {
   }
 }
 
-function buildUsageSummaryQuery(
-  preset: UsageSummaryQueryPreset,
-  customRange: UsageCustomRangeDraft,
-): UsageSummaryQuery {
-  if (preset !== 'custom') {
-    return { preset }
-  }
-
-  return {
-    preset,
-    startAt: toIsoDateTime(customRange.startAt),
-    endAt: toIsoDateTime(customRange.endAt),
-  }
-}
-
 function App() {
   const [appState, setAppState] = useState<DesktopAppState | null>(null)
   const [busyAction, setBusyAction] = useState<string | null>(null)
@@ -1458,16 +928,6 @@ function App() {
   const [providerEditor, setProviderEditor] = useState<ProviderEditorState | null>(null)
   const [quotaStateByFile, setQuotaStateByFile] = useState<Record<string, QuotaState>>({})
   const [quotaClockMs, setQuotaClockMs] = useState(() => Date.now())
-  const [usageCustomRangeDraft, setUsageCustomRangeDraft] = useState<UsageCustomRangeDraft>(() =>
-    createDefaultUsageCustomRange(),
-  )
-  const [usagePreset, setUsagePreset] = useState<UsageSummaryQueryPreset>(DEFAULT_USAGE_PRESET)
-  const [usageQuery, setUsageQuery] = useState<UsageSummaryQuery>({ preset: DEFAULT_USAGE_PRESET })
-  const [usageSummary, setUsageSummary] = useState<UsageSummary | null>(null)
-  const [usageLoading, setUsageLoading] = useState(false)
-  const [usagePricingConfig, setUsagePricingConfig] = useState<UsagePricingConfig>(() =>
-    loadUsagePricingConfig(),
-  )
   const [settingsDirty, setSettingsDirty] = useState(false)
   const [settingsDraft, setSettingsDraft] = useState<SaveKnownSettingsInput>(EMPTY_SETTINGS)
   const [fetchedModels, setFetchedModels] = useState<string[]>([])
@@ -1477,13 +937,6 @@ function App() {
   const quotaRequestedRef = useRef(new Set<string>())
   const authPollTimerRef = useRef<Record<string, number>>({})
   const deferredLogs = useDeferredValue(appState?.logs ?? [])
-  const preferredPricingModels = collectPreferredPricingModels(appState)
-  const sortedUsagePricingRules = getOrderedUsagePricingRules(
-    usagePricingConfig.rules,
-    usageSummary,
-    preferredPricingModels,
-  )
-  const usagePricing = computeUsagePricing(usageSummary, usagePricingConfig)
   const refreshQuotaClock = useEffectEvent(() => {
     setQuotaClockMs(Date.now())
   })
@@ -1545,47 +998,6 @@ async function loadState() {
           disabledCount: 0,
           totalCount: 0,
         }
-  }
-
-  function updateUsagePricingRule(
-    ruleId: string,
-    patch: Partial<UsagePricingRule>,
-  ) {
-    setUsagePricingConfig((current) => ({
-      ...current,
-      rules: current.rules.map((rule) =>
-        rule.id === ruleId ? { ...rule, ...patch } : rule,
-      ),
-    }))
-  }
-
-  function addUsagePricingRule() {
-    setUsagePricingConfig((current) => {
-      const nextId = getNextCustomPricingRuleNumber(current.rules)
-      return {
-        ...current,
-        rules: [...current.rules, createPricingRule(nextId)],
-      }
-    })
-  }
-
-  function deleteUsagePricingRule(ruleId: string) {
-    setUsagePricingConfig((current) => {
-      const nextRemovedRuleIds = DEFAULT_USAGE_PRICING_RULE_ID_SET.has(ruleId)
-        ? Array.from(new Set([...(current.removedRuleIds ?? []), ruleId]))
-        : [...(current.removedRuleIds ?? [])]
-
-      return {
-        ...current,
-        removedRuleIds: nextRemovedRuleIds,
-        rules: current.rules.filter((rule) => rule.id !== ruleId),
-      }
-    })
-  }
-
-  function resetUsagePricingRules() {
-    setUsagePricingConfig(getDefaultUsagePricingConfig())
-    pushNotice('success', '已恢复默认计价规则')
   }
 
   async function runStateAction(
@@ -1857,14 +1269,6 @@ async function loadState() {
     )
   }
 
-  async function fetchUsageSummaryForRange(_query: UsageSummaryQuery, announce = false) {
-    if (announce) {
-      pushNotice('error', '用量统计模块已移除。')
-    }
-
-    return false
-  }
-
   async function refreshCurrentPage() {
     setBusyAction('refresh-view')
 
@@ -1928,18 +1332,6 @@ async function loadState() {
         setBusyAction((current) => (current === 'refresh-view' ? null : current))
       }
     }
-  }
-
-  function applyUsagePreset(nextPreset: UsageSummaryQueryPreset) {
-    setUsagePreset(nextPreset)
-
-    if (nextPreset !== 'custom') {
-      setUsageQuery(buildUsageSummaryQuery(nextPreset, usageCustomRangeDraft))
-    }
-  }
-
-  function applyCustomUsageRange() {
-    pushNotice('error', '用量统计模块已移除。')
   }
 
   async function saveSettings() {
@@ -2134,14 +1526,6 @@ async function loadState() {
   }, [notice])
 
   useEffect(() => {
-    if (typeof window === 'undefined' || !window.localStorage) {
-      return
-    }
-
-    window.localStorage.setItem(USAGE_PRICING_STORAGE_KEY, JSON.stringify(usagePricingConfig))
-  }, [usagePricingConfig])
-
-  useEffect(() => {
     if (!appState || settingsDirty) {
       return
     }
@@ -2213,163 +1597,163 @@ async function loadState() {
 
     return (
       <div className="page-stack">
-        <section className="metrics-grid dashboard-metrics-grid">
-          <article className="metric-card metric-card-wide">
-            <span className="metric-label">代理状态</span>
-            <strong>{state.proxyStatus.running ? '运行中' : '未启动'}</strong>
-            <span className="metric-help">
-              端口 {state.proxyStatus.port} · PID {state.proxyStatus.pid ?? '未启动'}
-            </span>
-            <div className="action-row dashboard-action-grid dashboard-action-grid-compact">
-              <button
-                className="primary-button"
-                disabled={busyAction === 'start-proxy' || busyAction === 'stop-proxy'}
-                onClick={() => {
-                  void (state.proxyStatus.running
-                    ? runStateAction('stop-proxy', () => window.cliproxy.stopProxy(), '代理已停止')
-                    : runStateAction('start-proxy', () => window.cliproxy.startProxy(), '代理已启动'))
-                }}
-                type="button"
-              >
-                {state.proxyStatus.running ? <Square size={16} /> : <Play size={16} />}
-                {state.proxyStatus.running ? '停止代理' : '启动代理'}
-              </button>
-              <button className="ghost-button" onClick={() => void openWebUi()} type="button">
-                <ExternalLink size={16} />
-                打开 WebUI
-              </button>
-              <button
-                className="ghost-button"
-                disabled={!state.proxyStatus.running || busyAction === 'sync-runtime-config'}
-                onClick={() =>
-                  void runStateAction(
-                    'sync-runtime-config',
-                    () => window.cliproxy.syncRuntimeConfig(),
-                    '已固化 WebUI 配置到 proxy-config.yaml',
-                  )
-                }
-                type="button"
-              >
-                <Save size={16} />
-                固化 WebUI
-              </button>
-              <button
-                className="ghost-button danger"
-                disabled={busyAction === 'stop-quit'}
-                onClick={() =>
-                  void runAction(
-                    'stop-quit',
-                    () => window.cliproxy.stopProxyAndQuit(),
-                    '正在退出程序',
-                  )
-                }
-                type="button"
-              >
-                <Square size={16} />
-                停止代理并退出
-              </button>
-            </div>
-          </article>
-
-          <article className="metric-card">
-            <span className="metric-label">二进制版本</span>
-            <strong>{state.proxyBinary.currentVersion ?? '未识别'}</strong>
-            <div className="metric-copy-stack">
+        <section className="dashboard-fixed-layout">
+          <div className="dashboard-left-column">
+            <article className="metric-card dashboard-control-card">
+              <span className="metric-label">代理状态</span>
+              <strong>{state.proxyStatus.running ? '运行中' : '未启动'}</strong>
               <span className="metric-help">
-                最新 {state.proxyBinary.latestVersion ?? '未检查'} · 路径{' '}
-                {state.proxyBinary.path ? '已就绪' : '未找到'}
+                端口 {state.proxyStatus.port} · PID {state.proxyStatus.pid ?? '未启动'}
               </span>
-              <div className="metric-pairs metric-pairs-compact">
-                <span>当前 {state.proxyBinary.currentChannel ?? '未识别'}</span>
-                <span>目标 {state.proxyBinary.selectedChannel}</span>
+              <div className="action-row dashboard-action-grid dashboard-action-grid-compact">
+                <button
+                  className="primary-button"
+                  disabled={busyAction === 'start-proxy' || busyAction === 'stop-proxy'}
+                  onClick={() => {
+                    void (state.proxyStatus.running
+                      ? runStateAction('stop-proxy', () => window.cliproxy.stopProxy(), '代理已停止')
+                      : runStateAction('start-proxy', () => window.cliproxy.startProxy(), '代理已启动'))
+                  }}
+                  type="button"
+                >
+                  {state.proxyStatus.running ? <Square size={16} /> : <Play size={16} />}
+                  {state.proxyStatus.running ? '停止代理' : '启动代理'}
+                </button>
+                <button className="ghost-button" onClick={() => void openWebUi()} type="button">
+                  <ExternalLink size={16} />
+                  打开 WebUI
+                </button>
+                <button
+                  className="ghost-button"
+                  disabled={!state.proxyStatus.running || busyAction === 'sync-runtime-config'}
+                  onClick={() =>
+                    void runStateAction(
+                      'sync-runtime-config',
+                      () => window.cliproxy.syncRuntimeConfig(),
+                      '已固化 WebUI 配置到 proxy-config.yaml',
+                    )
+                  }
+                  type="button"
+                >
+                  <Save size={16} />
+                  固化 WebUI
+                </button>
+                <button
+                  className="ghost-button danger"
+                  disabled={busyAction === 'stop-quit'}
+                  onClick={() =>
+                    void runAction(
+                      'stop-quit',
+                      () => window.cliproxy.stopProxyAndQuit(),
+                      '正在退出程序',
+                    )
+                  }
+                  type="button"
+                >
+                  <Square size={16} />
+                  停止代理并退出
+                </button>
               </div>
-            </div>
-            <div className="action-row metric-action-grid">
-              <button
-                className="ghost-button"
-                onClick={() =>
-                  void runStateAction(
-                    'check-binary',
-                    () => window.cliproxy.checkProxyBinaryUpdate(),
-                    '已检查更新',
-                  )
-                }
-                type="button"
-              >
-                <RefreshCcw size={16} />
-                检查更新
-              </button>
-              <button
-                className="primary-button"
-                disabled={!state.proxyBinary.updateAvailable}
-                onClick={() =>
-                  void runStateAction(
-                    'update-binary',
-                    () => window.cliproxy.updateProxyBinary(),
-                    `${getSidecarDisplayName(state.knownSettings.sidecarChannel)} 已更新`,
-                  )
-                }
-                type="button"
-              >
-                <HardDriveUpload size={16} />
-                执行更新
-              </button>
-            </div>
-          </article>
+            </article>
 
-          <article className="metric-card">
-            <span className="metric-label">软件更新</span>
-            <strong>v{state.appUpdate.currentVersion}</strong>
-            <div className="metric-copy-stack">
-              <span className="metric-help">
-                最新 {state.appUpdate.latestVersion ? `v${state.appUpdate.latestVersion}` : '未检查'} · 资产{' '}
-                {state.appUpdate.latestAssetName ?? '未解析'}
-              </span>
-              <div className="metric-pairs metric-pairs-compact">
-                <span>上次检查 {formatTime(state.appUpdate.lastCheckedAt)}</span>
-                <span>上次下载 {formatTime(state.appUpdate.lastDownloadedAt)}</span>
+            <article className="metric-card dashboard-control-card">
+              <span className="metric-label">二进制版本</span>
+              <strong>{state.proxyBinary.currentVersion ?? '未识别'}</strong>
+              <div className="metric-copy-stack">
+                <span className="metric-help">
+                  最新 {state.proxyBinary.latestVersion ?? '未检查'} · 路径{' '}
+                  {state.proxyBinary.path ? '已就绪' : '未找到'}
+                </span>
+                <div className="metric-pairs metric-pairs-compact">
+                  <span>当前 {state.proxyBinary.currentChannel ?? '未识别'}</span>
+                  <span>目标 {state.proxyBinary.selectedChannel}</span>
+                </div>
               </div>
-            </div>
-            <div className="action-row metric-action-grid">
-              <button
-                className="ghost-button"
-                onClick={() =>
-                  void runStateAction(
-                    'check-app-update',
-                    () => window.cliproxy.checkAppUpdate(),
-                    '已检查桌面应用更新',
-                  )
-                }
-                type="button"
-              >
-                <RefreshCcw size={16} />
-                检查更新
-              </button>
-              <button
-                className="primary-button"
-                disabled={!state.appUpdate.updateAvailable}
-                onClick={() =>
-                  void runStateAction(
-                    'update-app',
-                    () => window.cliproxy.updateApp(),
-                    '已开始软件更新',
-                  )
-                }
-                type="button"
-              >
-                <Download size={16} />
-                执行更新
-              </button>
-            </div>
-            {state.appUpdate.lastError ? (
-              <span className="field-help">更新异常：{state.appUpdate.lastError}</span>
-            ) : null}
-          </article>
+              <div className="action-row metric-action-grid">
+                <button
+                  className="ghost-button"
+                  onClick={() =>
+                    void runStateAction(
+                      'check-binary',
+                      () => window.cliproxy.checkProxyBinaryUpdate(),
+                      '已检查更新',
+                    )
+                  }
+                  type="button"
+                >
+                  <RefreshCcw size={16} />
+                  检查更新
+                </button>
+                <button
+                  className="primary-button"
+                  disabled={!state.proxyBinary.updateAvailable}
+                  onClick={() =>
+                    void runStateAction(
+                      'update-binary',
+                      () => window.cliproxy.updateProxyBinary(),
+                      `${getSidecarDisplayName(state.knownSettings.sidecarChannel)} 已更新`,
+                    )
+                  }
+                  type="button"
+                >
+                  <HardDriveUpload size={16} />
+                  执行更新
+                </button>
+              </div>
+            </article>
 
-        </section>
+            <article className="metric-card dashboard-control-card">
+              <span className="metric-label">软件更新</span>
+              <strong>v{state.appUpdate.currentVersion}</strong>
+              <div className="metric-copy-stack">
+                <span className="metric-help">
+                  最新 {state.appUpdate.latestVersion ? `v${state.appUpdate.latestVersion}` : '未检查'} · 资产{' '}
+                  {state.appUpdate.latestAssetName ?? '未解析'}
+                </span>
+                <div className="metric-pairs metric-pairs-compact">
+                  <span>上次检查 {formatTime(state.appUpdate.lastCheckedAt)}</span>
+                  <span>上次下载 {formatTime(state.appUpdate.lastDownloadedAt)}</span>
+                </div>
+              </div>
+              <div className="action-row metric-action-grid">
+                <button
+                  className="ghost-button"
+                  onClick={() =>
+                    void runStateAction(
+                      'check-app-update',
+                      () => window.cliproxy.checkAppUpdate(),
+                      '已检查桌面应用更新',
+                    )
+                  }
+                  type="button"
+                >
+                  <RefreshCcw size={16} />
+                  检查更新
+                </button>
+                <button
+                  className="primary-button"
+                  disabled={!state.appUpdate.updateAvailable}
+                  onClick={() =>
+                    void runStateAction(
+                      'update-app',
+                      () => window.cliproxy.updateApp(),
+                      '已开始软件更新',
+                    )
+                  }
+                  type="button"
+                >
+                  <Download size={16} />
+                  执行更新
+                </button>
+              </div>
+              {state.appUpdate.lastError ? (
+                <span className="field-help">更新异常：{state.appUpdate.lastError}</span>
+              ) : null}
+            </article>
+          </div>
 
-        <section className="dashboard-grid dashboard-grid-compact">
-          <section className="section-card dashboard-section">
+          <div className="dashboard-right-column">
+            <section className="section-card dashboard-section dashboard-right-section">
             <div className="section-head">
               <div>
                 <h2>认证额度</h2>
@@ -2486,9 +1870,9 @@ async function loadState() {
                 })}
               </div>
             )}
-          </section>
+            </section>
 
-          <section className="section-card dashboard-section">
+            <section className="section-card dashboard-section dashboard-right-section">
             <div className="section-head">
               <div>
                 <h2>快捷授权</h2>
@@ -2574,7 +1958,8 @@ async function loadState() {
                 )
               })}
             </div>
-          </section>
+            </section>
+          </div>
         </section>
       </div>
     )
@@ -3180,459 +2565,6 @@ async function loadState() {
             }
           />
         ) : null}
-      </div>
-    )
-  }
-
-  function renderUsagePricingRules() {
-    return (
-      <section className="section-card stack-column">
-        <div className="section-head">
-          <div>
-            <h2>计价规则</h2>
-            <p>
-              按模型模式匹配价格。默认规则会在每次编译时同步官方价格页；当前构建同步时间{' '}
-              {formatTime(usagePricingConfig.defaultsUpdatedAt)}。你可以手动覆盖。
-            </p>
-            <p>显示顺序：最近使用最多的模型优先，其次是当前已配置可用的模型。</p>
-          </div>
-          <div className="action-row">
-            <button className="ghost-button" onClick={resetUsagePricingRules} type="button">
-              恢复默认
-            </button>
-            <button className="primary-button" onClick={addUsagePricingRule} type="button">
-              <Plus size={16} />
-              新增规则
-            </button>
-          </div>
-        </div>
-
-        <div className="form-grid usage-pricing-header-grid">
-          <TextField
-            help="仅用于显示，不参与计算。"
-            label="货币符号"
-            onChange={(value) =>
-              setUsagePricingConfig((current) => ({ ...current, currency: value || DEFAULT_USAGE_CURRENCY }))
-            }
-            value={usagePricingConfig.currency}
-          />
-          <div className="usage-pricing-summary-card">
-            <strong>{formatMoney(usagePricing.estimatedCost, usagePricingConfig.currency)}</strong>
-            <span>当前范围预估总成本</span>
-            <div className="usage-pricing-breakdown">
-              <span>输入 {formatMoney(usagePricing.inputCost, usagePricingConfig.currency)}</span>
-              <span>输出 {formatMoney(usagePricing.outputCost, usagePricingConfig.currency)}</span>
-              <span>缓存读 {formatMoney(usagePricing.cacheReadCost, usagePricingConfig.currency)}</span>
-              <span>缓存写 {formatMoney(usagePricing.cacheWriteCost, usagePricingConfig.currency)}</span>
-            </div>
-          </div>
-        </div>
-
-        {usagePricing.unmatchedModels.length > 0 ? (
-          <div className="warning-banner">
-            <strong>有模型尚未匹配计价规则</strong>
-            <span>{usagePricing.unmatchedModels.join('、')}</span>
-          </div>
-        ) : null}
-
-        {(usagePricingConfig.syncWarnings?.length ?? 0) > 0 ? (
-          <div className="warning-banner">
-            <strong>部分官方价格同步失败</strong>
-            <span>{usagePricingConfig.syncWarnings?.join('；')}</span>
-          </div>
-        ) : null}
-
-        <div className="usage-pricing-rule-list">
-          {sortedUsagePricingRules.map((rule) => (
-            <article className="usage-pricing-rule-card" key={rule.id}>
-              <div className="usage-pricing-rule-head">
-                <strong>{rule.name || '未命名规则'}</strong>
-                <button
-                  className="icon-button danger"
-                  onClick={() => deleteUsagePricingRule(rule.id)}
-                  type="button"
-                >
-                  <Trash2 size={16} />
-                </button>
-              </div>
-              <div className="form-grid usage-pricing-rule-grid">
-                <TextField
-                  help="例如 GPT-5.4 / Claude Sonnet 4.5。"
-                  label="规则名"
-                  onChange={(value) => updateUsagePricingRule(rule.id, { name: value })}
-                  value={rule.name}
-                />
-                <TextField
-                  help="支持 * 通配，多个模式用逗号或换行分隔。"
-                  label="模型模式"
-                  onChange={(value) => updateUsagePricingRule(rule.id, { modelPattern: value })}
-                  placeholder="gpt-5.4*, gpt-pro-fast*"
-                  value={rule.modelPattern}
-                />
-                <TextField
-                  help="预留字段，当前仅做展示。"
-                  label="Reasoning 匹配"
-                  onChange={(value) => updateUsagePricingRule(rule.id, { reasoningEffortPattern: value || '*' })}
-                  placeholder="* / high / xhigh"
-                  value={rule.reasoningEffortPattern}
-                />
-                <TextField
-                  help="默认 1。可用来修正内部倍率。"
-                  label="价格倍率"
-                  onChange={(value) =>
-                    updateUsagePricingRule(rule.id, { multiplier: normalizePricingNumber(Number(value || 0)) || 1 })
-                  }
-                  step={0.0001}
-                  type="number"
-                  value={rule.multiplier}
-                />
-                <TextField
-                  help="按 1M fresh input tokens 计价。"
-                  label="输入价格 / 1M"
-                  onChange={(value) =>
-                    updateUsagePricingRule(rule.id, {
-                      inputPricePerMillion: normalizePricingNumber(Number(value || 0)),
-                    })
-                  }
-                  step={0.0001}
-                  type="number"
-                  value={rule.inputPricePerMillion}
-                />
-                <TextField
-                  help="按 1M output tokens 计价。"
-                  label="输出价格 / 1M"
-                  onChange={(value) =>
-                    updateUsagePricingRule(rule.id, {
-                      outputPricePerMillion: normalizePricingNumber(Number(value || 0)),
-                    })
-                  }
-                  step={0.0001}
-                  type="number"
-                  value={rule.outputPricePerMillion}
-                />
-                <TextField
-                  help="按 1M cache read tokens 计价。"
-                  label="缓存读价格 / 1M"
-                  onChange={(value) =>
-                    updateUsagePricingRule(rule.id, {
-                      cacheReadPricePerMillion: normalizePricingNumber(Number(value || 0)),
-                    })
-                  }
-                  step={0.0001}
-                  type="number"
-                  value={rule.cacheReadPricePerMillion}
-                />
-                <TextField
-                  help="按 1M cache creation tokens 计价。"
-                  label="缓存写价格 / 1M"
-                  onChange={(value) =>
-                    updateUsagePricingRule(rule.id, {
-                      cacheWritePricePerMillion: normalizePricingNumber(Number(value || 0)),
-                    })
-                  }
-                  step={0.0001}
-                  type="number"
-                  value={rule.cacheWritePricePerMillion}
-                />
-                <TextField
-                  help="价格来源链接，便于后续核对。"
-                  label="来源 URL"
-                  onChange={(value) => updateUsagePricingRule(rule.id, { sourceUrl: value })}
-                  placeholder="https://..."
-                  value={rule.sourceUrl}
-                />
-                <ToggleField
-                  checked={rule.enabled}
-                  help="关闭后不会参与计费匹配。"
-                  label="启用规则"
-                  onChange={(checked) => updateUsagePricingRule(rule.id, { enabled: checked })}
-                />
-              </div>
-              <TextAreaField
-                help="记录模型分组说明、上下文限制或人工修正原因。"
-                label="备注"
-                onChange={(value) => updateUsagePricingRule(rule.id, { notes: value })}
-                rows={2}
-                value={rule.notes}
-              />
-            </article>
-          ))}
-        </div>
-
-        <div className="usage-pricing-reference-list">
-          {PRICING_REFERENCE_LINKS.map((item) => (
-            <button
-              className="ghost-button"
-              key={item.url}
-              onClick={() => void window.cliproxy.openExternal(item.url)}
-              type="button"
-            >
-              <ExternalLink size={16} />
-              {item.label}
-            </button>
-          ))}
-        </div>
-      </section>
-    )
-  }
-
-  function renderUsagePage() {
-    const summary = usageSummary
-    const usageModels =
-      usagePricing.pricedModels.filter((item) => item.requests > 0 || item.totalTokens > 0) ?? []
-    const requestTrend = summary?.requestsByDay ?? []
-    const tokenTrend = summary?.tokensByDay ?? []
-    const requestMax = Math.max(...requestTrend.map((item) => item.value), 1)
-    const tokenMax = Math.max(...tokenTrend.map((item) => item.value), 1)
-    const cacheHitRate = summary && summary.inputTokens > 0 ? (summary.cachedTokens / summary.inputTokens) * 100 : 0
-
-    function renderTrendCard(
-      title: string,
-      points: UsagePoint[],
-      maxValue: number,
-      emptyText: string,
-    ) {
-      return (
-        <article className="usage-trend-card">
-          <div className="quota-head">
-            <strong>{title}</strong>
-            <span>{points.length} 个时间桶</span>
-          </div>
-          {points.length === 0 ? (
-            <div className="quota-empty">{emptyText}</div>
-          ) : (
-            <div className="usage-trend-chart">
-              {points.map((point) => (
-                <div
-                  className="usage-trend-column"
-                  key={point.label}
-                  title={`${point.label} · ${formatCount(point.value)}`}
-                >
-                  <span className="usage-trend-value">{formatCompactCount(point.value)}</span>
-                  <span className="usage-trend-bar-track">
-                    <span
-                      className="usage-trend-bar-fill"
-                      style={{
-                        height: `${Math.max(8, Math.min(100, (point.value / maxValue) * 100))}%`,
-                      }}
-                    />
-                  </span>
-                  <span className="usage-trend-label">{point.label}</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </article>
-      )
-    }
-
-    return (
-      <div className="page-stack">
-        <section className="section-card stack-column">
-          <div className="section-head">
-            <div>
-              <h2>查询范围</h2>
-              <p>按时间周期或指定时间段统计缓存命中、净消耗和计费输入。</p>
-            </div>
-            <button
-              className="ghost-button"
-              disabled={usageLoading || !state.proxyStatus.running}
-              onClick={() => void fetchUsageSummaryForRange(usageQuery, true)}
-              type="button"
-            >
-              <RefreshCcw size={16} />
-              刷新统计
-            </button>
-          </div>
-
-          <div className="usage-filter-panel">
-            <div className="usage-preset-list">
-              {[
-                ['24h', '近 24 小时'],
-                ['7d', '近 7 天'],
-                ['30d', '近 30 天'],
-                ['all', '全部时间'],
-                ['custom', '自定义'],
-              ].map(([value, label]) => (
-                <button
-                  className={`usage-preset-chip ${usagePreset === value ? 'active' : ''}`}
-                  key={value}
-                  onClick={() => applyUsagePreset(value as UsageSummaryQueryPreset)}
-                  type="button"
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-
-            {usagePreset === 'custom' ? (
-              <div className="form-grid two-columns usage-filter-grid">
-                <TextField
-                  help="留空表示不限制起始时间。"
-                  label="开始时间"
-                  onChange={(value) =>
-                    setUsageCustomRangeDraft((current) => ({ ...current, startAt: value }))
-                  }
-                  type="datetime-local"
-                  value={usageCustomRangeDraft.startAt}
-                />
-                <TextField
-                  help="留空表示统计到最新请求。"
-                  label="结束时间"
-                  onChange={(value) =>
-                    setUsageCustomRangeDraft((current) => ({ ...current, endAt: value }))
-                  }
-                  type="datetime-local"
-                  value={usageCustomRangeDraft.endAt}
-                />
-              </div>
-            ) : null}
-
-            <div className="usage-range-meta">
-              <span>当前范围：{summary?.rangeLabel ?? '未查询'}</span>
-              <span>时间窗口：{getUsageQueryRangeText(summary)}</span>
-              <span>更新时间：{summary ? formatTime(summary.lastUpdatedAt) : '未查询'}</span>
-              {usagePreset === 'custom' ? (
-                <button className="primary-button" onClick={applyCustomUsageRange} type="button">
-                  应用时间段
-                </button>
-              ) : null}
-            </div>
-          </div>
-        </section>
-
-        {usageLoading && !summary ? (
-          <section className="section-card">
-            <div className="quota-empty">正在读取用量统计...</div>
-          </section>
-        ) : summary?.error ? (
-          <section className="section-card">
-            <div className="quota-empty error">{summary.error}</div>
-          </section>
-        ) : summary ? (
-          <>
-            <section className="metrics-grid usage-metrics-grid">
-              <article className="metric-card metric-card-highlight">
-                <span className="metric-label">净消耗 Tokens</span>
-                <strong>{formatCount(summary.netTokens)}</strong>
-                <span className="metric-help">
-                  总消耗 {formatCount(summary.totalTokens)} · 缓存命中 {formatCount(summary.cachedTokens)}
-                </span>
-                <div className="metric-pairs">
-                  <span>计费输入 {formatCount(summary.billableInputTokens)}</span>
-                  <span>Reasoning {formatCount(summary.reasoningTokens)}</span>
-                </div>
-              </article>
-              <article className="metric-card">
-                <span className="metric-label">请求数</span>
-                <strong>{formatCount(summary.totalRequests)}</strong>
-                <span className="metric-help">
-                  成功 {formatCount(summary.successCount)} · 失败 {formatCount(summary.failureCount)}
-                </span>
-                <div className="metric-pairs">
-                  <span>成功率 {formatRate(summary.successCount, summary.totalRequests)}</span>
-                  <span>缓存命中率 {formatPercent(cacheHitRate)}</span>
-                </div>
-              </article>
-              <article className="metric-card">
-                <span className="metric-label">预估成本</span>
-                <strong>{formatMoney(usagePricing.estimatedCost, usagePricingConfig.currency)}</strong>
-                <span className="metric-help">
-                  输入 {formatMoney(usagePricing.inputCost, usagePricingConfig.currency)} · 输出{' '}
-                  {formatMoney(usagePricing.outputCost, usagePricingConfig.currency)}
-                </span>
-                <div className="metric-pairs">
-                  <span>缓存读 {formatMoney(usagePricing.cacheReadCost, usagePricingConfig.currency)}</span>
-                  <span>缓存写 {formatMoney(usagePricing.cacheWriteCost, usagePricingConfig.currency)}</span>
-                </div>
-              </article>
-              <article className="metric-card">
-                <span className="metric-label">输入 / 输出</span>
-                <strong>{formatCount(summary.inputTokens)}</strong>
-                <span className="metric-help">输入 Tokens</span>
-                <div className="metric-pairs">
-                  <span>输出 {formatCount(summary.outputTokens)}</span>
-                  <span>缓存 {formatCount(summary.cachedTokens)}</span>
-                  <span>缓存写 {formatCount(summary.cacheCreationTokens)}</span>
-                </div>
-              </article>
-              <article className="metric-card">
-                <span className="metric-label">统计口径</span>
-                <strong>{summary.usedDetailRange ? '明细聚合' : '汇总聚合'}</strong>
-                <span className="metric-help">{summary.rangeLabel}</span>
-                <div className="metric-pairs">
-                  <span>时间桶 {summary.rangeGranularity === 'hour' ? '按小时' : '按天'}</span>
-                  <span>更新时间 {formatTime(summary.lastUpdatedAt)}</span>
-                </div>
-              </article>
-            </section>
-
-            {renderUsagePricingRules()}
-
-            <section className="usage-page-grid">
-              <section className="section-card stack-column">
-                <div className="section-head">
-                  <div>
-                    <h2>趋势</h2>
-                    <p>请求量和净消耗按时间桶展开，便于核对缓存命中后的真实成本。</p>
-                  </div>
-                </div>
-
-                <div className="usage-trend-grid">
-                  {renderTrendCard('请求趋势', requestTrend, requestMax, '所选范围内暂无请求记录。')}
-                  {renderTrendCard('净消耗趋势', tokenTrend, tokenMax, '所选范围内暂无 Token 明细。')}
-                </div>
-              </section>
-
-              <section className="section-card stack-column">
-                <div className="section-head">
-                  <div>
-                    <h2>模型排行</h2>
-                    <p>优先按净消耗排序，同时展示总消耗、缓存命中和净额。</p>
-                  </div>
-                </div>
-
-                {usageModels.length === 0 ? (
-                  <div className="quota-empty">所选范围内暂无模型统计。</div>
-                ) : (
-                  <div className="usage-model-list">
-                    {usageModels.map((item) => (
-                      <article className="usage-model-row usage-model-row-detailed" key={item.model}>
-                        <div className="usage-model-copy">
-                          <strong>{item.model}</strong>
-                          <span>
-                            {formatCount(item.requests)} 请求 · 成功 {formatCount(item.successCount)} · 失败{' '}
-                            {formatCount(item.failureCount)}
-                          </span>
-                        </div>
-                        <div className="usage-model-metrics usage-model-metrics-detailed">
-                          <span>总 {formatCount(item.totalTokens)}</span>
-                          <span>净 {formatCount(item.netTokens)}</span>
-                          <span>缓存 {formatCount(item.cachedTokens)}</span>
-                          <span>缓存写 {formatCount(item.cacheCreationTokens)}</span>
-                          <span>计费输入 {formatCount(item.billableInputTokens)}</span>
-                          <span>命中率 {formatRate(item.cachedTokens, item.inputTokens)}</span>
-                          <span>成本 {formatMoney(item.estimatedCost, usagePricingConfig.currency)}</span>
-                        </div>
-                        {item.matchedRuleName ? (
-                          <span className="usage-pricing-match">规则：{item.matchedRuleName}</span>
-                        ) : (
-                          <span className="usage-pricing-match unmatched">未匹配计价规则</span>
-                        )}
-                      </article>
-                    ))}
-                  </div>
-                )}
-              </section>
-            </section>
-          </>
-        ) : (
-          <section className="section-card">
-            <div className="quota-empty">
-              {state.proxyStatus.running ? '正在等待首批用量数据。' : '暂无历史用量统计。'}
-            </div>
-          </section>
-        )}
       </div>
     )
   }

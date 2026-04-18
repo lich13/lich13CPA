@@ -363,34 +363,6 @@ export interface UsageSummary {
   error: string | null
 }
 
-export interface UsagePricingRule {
-  id: string
-  enabled: boolean
-  name: string
-  modelPattern: string
-  reasoningEffortPattern: string
-  inputPricePerMillion: number
-  outputPricePerMillion: number
-  cacheReadPricePerMillion: number
-  cacheWritePricePerMillion: number
-  multiplier: number
-  sourceUrl: string
-  notes: string
-}
-
-export interface UsagePricingSourceLink {
-  label: string
-  url: string
-}
-
-export interface UsagePricingConfig {
-  currency: string
-  defaultsUpdatedAt?: string | null
-  removedRuleIds?: string[]
-  rules: UsagePricingRule[]
-  syncWarnings?: string[]
-}
-
 export interface ProxyStatus {
   running: boolean
   pid: number | null
