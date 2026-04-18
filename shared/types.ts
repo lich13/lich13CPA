@@ -228,10 +228,6 @@ export interface AuthFileRecord {
   unavailable: boolean
   createdAt: string | null
   updatedAt: string | null
-  successCount: number
-  failureCount: number
-  totalRequests: number
-  lastUsedAt: string | null
   planType: string | null
   detailItems: AuthFileDetailItem[]
 }
@@ -307,60 +303,6 @@ export interface LogEntry {
   level: LogLevel
   source: 'app' | 'proxy'
   message: string
-}
-
-export interface UsagePoint {
-  label: string
-  value: number
-}
-
-export type UsageSummaryQueryPreset = '24h' | '7d' | '30d' | 'all' | 'custom'
-
-export interface UsageSummaryQuery {
-  preset?: UsageSummaryQueryPreset
-  startAt?: string | null
-  endAt?: string | null
-}
-
-export interface UsageModelSummary {
-  model: string
-  requests: number
-  successCount: number
-  failureCount: number
-  totalTokens: number
-  netTokens: number
-  billableInputTokens: number
-  inputTokens: number
-  outputTokens: number
-  cachedTokens: number
-  cacheCreationTokens: number
-  reasoningTokens: number
-}
-
-export interface UsageSummary {
-  available: boolean
-  rangePreset: UsageSummaryQueryPreset
-  rangeLabel: string
-  rangeStartAt: string | null
-  rangeEndAt: string | null
-  rangeGranularity: 'hour' | 'day'
-  usedDetailRange: boolean
-  totalRequests: number
-  successCount: number
-  failureCount: number
-  totalTokens: number
-  netTokens: number
-  billableInputTokens: number
-  inputTokens: number
-  outputTokens: number
-  cachedTokens: number
-  cacheCreationTokens: number
-  reasoningTokens: number
-  requestsByDay: UsagePoint[]
-  tokensByDay: UsagePoint[]
-  topModels: UsageModelSummary[]
-  lastUpdatedAt: string | null
-  error: string | null
 }
 
 export interface ProxyStatus {

@@ -27,7 +27,6 @@ use reqwest::{
     Client,
 };
 use rfd::FileDialog;
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Number, Value};
 use sysproxy::Sysproxy;
@@ -56,8 +55,6 @@ fn apply_windows_command_flags(_command: &mut Command) {}
 const DESKTOP_METADATA_KEY: &str = "x-cliproxy-desktop";
 const MAIN_LOG_NAME: &str = "main.log";
 const AUTH_DIRECTORY_NAME: &str = "auth-files";
-const USAGE_STATS_FILE_NAME: &str = "usage-stats.json";
-const USAGE_DB_FILE_NAME: &str = "usage-stats.sqlite3";
 const DEFAULT_PORT: u16 = 8313;
 const DEFAULT_PROXY_API_KEY: &str = "cliproxy-local";
 const DEFAULT_MANAGEMENT_API_KEY: &str = "cliproxy-management";
@@ -68,8 +65,6 @@ const DEFAULT_STREAM_BOOTSTRAP_RETRIES: u16 = 2;
 const DEFAULT_NON_STREAM_KEEPALIVE_INTERVAL_SECONDS: u16 = 15;
 const DEFAULT_LOGS_MAX_TOTAL_SIZE_MB: u32 = 400;
 const MAX_LOG_ENTRIES: usize = 600;
-const MAX_USAGE_PROCESSED_FILE_IDS: usize = 6000;
-const MIN_USAGE_LOG_FILE_AGE_MS: u64 = 1500;
 const CLIPROXY_MAIN_REPOSITORY: &str = "router-for-me/CLIProxyAPI";
 const CLIPROXY_PLUS_REPOSITORY: &str = "router-for-me/CLIProxyAPIPlus";
 const SIDECAR_CHANNEL_MAIN: &str = "main";
@@ -351,8 +346,6 @@ struct ResolvedPaths {
     gui_state_path: PathBuf,
     auth_dir: PathBuf,
     logs_dir: PathBuf,
-    usage_stats_path: PathBuf,
-    usage_db_path: PathBuf,
     binary_candidates: Vec<PathBuf>,
 }
 
@@ -360,43 +353,6 @@ struct ResolvedPaths {
 pub struct PendingOAuthState {
     pub provider: String,
     pub state: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PersistedUsageRecord {
-    record_id: String,
-    model: String,
-    timestamp: Option<String>,
-    timestamp_ms: Option<i64>,
-    total_tokens: i64,
-    input_tokens: i64,
-    output_tokens: i64,
-    cached_tokens: i64,
-    #[serde(default)]
-    cache_creation_tokens: i64,
-    reasoning_tokens: i64,
-    failed: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PersistedUsageState {
-    version: i64,
-    updated_at: Option<String>,
-    processed_file_ids: Vec<String>,
-    records: Vec<PersistedUsageRecord>,
-}
-
-impl Default for PersistedUsageState {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            updated_at: None,
-            processed_file_ids: Vec::new(),
-            records: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -436,7 +392,6 @@ struct BackendInner {
     paths: ResolvedPaths,
     logs: Mutex<Vec<LogEntry>>,
     gui_state_cache: Mutex<Option<GuiState>>,
-    usage_state_cache: Mutex<Option<PersistedUsageState>>,
     proxy_status: Mutex<ProxyStatusData>,
     proxy_binary: Mutex<ProxyBinaryStateData>,
     app_update: Mutex<AppUpdateStateData>,
@@ -485,7 +440,6 @@ impl Backend {
                 client,
                 logs: Mutex::new(Vec::new()),
                 gui_state_cache: Mutex::new(None),
-                usage_state_cache: Mutex::new(None),
                 proxy_status: Mutex::new(ProxyStatusData::default()),
                 proxy_binary: Mutex::new(ProxyBinaryStateData::default()),
                 app_update: Mutex::new(AppUpdateStateData::default()),
@@ -888,44 +842,6 @@ impl Backend {
         self.sync_runtime_config_file().await?;
         self.emit_state_changed();
         self.build_app_state(None).await
-    }
-
-    pub async fn refresh_usage(&self) -> Result<Value> {
-        self.ingest_usage_logs_to_store()?;
-        self.emit_state_changed();
-        self.build_app_state(None).await
-    }
-
-    pub async fn get_usage_summary(&self, query: Option<Value>) -> Result<Value> {
-        self.ensure_app_files()?;
-        let query = query.unwrap_or(Value::Null);
-        if self.is_proxy_running() {
-            let runtime = self.resolve_management_runtime()?;
-            match self
-                .fetch_management_json(runtime.0, &runtime.1, "/v0/management/usage")
-                .await
-            {
-                Ok(payload) => {
-                    let management_summary = build_usage_summary(&payload, Some(&query));
-                    let local_summary = self.build_usage_summary_from_logs(Some(&query))?;
-                    if should_use_usage_log_fallback(&management_summary) {
-                        return Ok(local_summary.unwrap_or(management_summary));
-                    }
-                    return Ok(management_summary);
-                }
-                Err(error) => {
-                    if let Some(local_summary) = self.build_usage_summary_from_logs(Some(&query))? {
-                        return Ok(local_summary);
-                    }
-
-                    return Ok(empty_usage_summary(Some(error.to_string()), Some(&query)));
-                }
-            }
-        }
-
-        Ok(self
-            .build_usage_summary_from_logs(Some(&query))?
-            .unwrap_or_else(|| empty_usage_summary(None, Some(&query))))
     }
 
     pub async fn get_provider_auth_url(&self, provider: String) -> Result<Value> {
@@ -1449,10 +1365,6 @@ impl Backend {
             &snapshot_root.join(AUTH_DIRECTORY_NAME),
         )?;
         copy_path_recursive(&self.inner.paths.logs_dir, &snapshot_root.join("logs"))?;
-        copy_path_recursive(
-            &self.inner.paths.usage_stats_path,
-            &snapshot_root.join(USAGE_STATS_FILE_NAME),
-        )?;
         Ok(())
     }
 
@@ -1470,7 +1382,6 @@ impl Backend {
         restore_item("gui-state.json", &self.inner.paths.gui_state_path)?;
         restore_item(AUTH_DIRECTORY_NAME, &self.inner.paths.auth_dir)?;
         restore_item("logs", &self.inner.paths.logs_dir)?;
-        restore_item(USAGE_STATS_FILE_NAME, &self.inner.paths.usage_stats_path)?;
         Ok(())
     }
 
@@ -2091,7 +2002,6 @@ impl Backend {
         fs::create_dir_all(&self.inner.paths.base_dir)?;
         fs::create_dir_all(&self.inner.paths.auth_dir)?;
         fs::create_dir_all(&self.inner.paths.logs_dir)?;
-        self.cleanup_legacy_usage_files().ok();
         self.migrate_legacy_runtime_files()?;
         self.migrate_legacy_auth_files()?;
 
@@ -2208,180 +2118,6 @@ impl Backend {
         Ok(())
     }
 
-    fn open_usage_db(&self) -> Result<Connection> {
-        Ok(Connection::open(&self.inner.paths.usage_db_path)?)
-    }
-
-    fn ensure_usage_db_schema(&self, conn: &Connection) -> Result<()> {
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS usage_meta (
-              key TEXT PRIMARY KEY,
-              value TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS usage_processed_files (
-              seq INTEGER PRIMARY KEY,
-              file_id TEXT NOT NULL UNIQUE
-            );
-
-            CREATE TABLE IF NOT EXISTS usage_records (
-              record_id TEXT PRIMARY KEY,
-              model TEXT NOT NULL,
-              timestamp TEXT,
-              timestamp_ms INTEGER,
-              total_tokens INTEGER NOT NULL,
-              input_tokens INTEGER NOT NULL,
-              output_tokens INTEGER NOT NULL,
-              cached_tokens INTEGER NOT NULL,
-              cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
-              reasoning_tokens INTEGER NOT NULL,
-              failed INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_usage_records_timestamp_ms ON usage_records(timestamp_ms);
-            CREATE INDEX IF NOT EXISTS idx_usage_records_model ON usage_records(model);
-            "#,
-        )?;
-        Ok(())
-    }
-
-    fn ensure_usage_database(&self) -> Result<()> {
-        let conn = self.open_usage_db()?;
-        self.ensure_usage_db_schema(&conn)?;
-        let has_data: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM usage_records LIMIT 1) OR EXISTS(SELECT 1 FROM usage_processed_files LIMIT 1)",
-            [],
-            |row| row.get(0),
-        )?;
-        if has_data {
-            return Ok(());
-        }
-
-        let legacy_state = match fs::read_to_string(&self.inner.paths.usage_stats_path) {
-            Ok(raw) => serde_json::from_str::<PersistedUsageState>(&raw).unwrap_or_default(),
-            Err(_) => PersistedUsageState::default(),
-        };
-        if legacy_state.records.is_empty() && legacy_state.processed_file_ids.is_empty() {
-            return Ok(());
-        }
-        self.write_usage_state_to_db(&conn, &legacy_state)?;
-        Ok(())
-    }
-
-    fn read_usage_state_from_db(&self, conn: &Connection) -> Result<PersistedUsageState> {
-        let updated_at = conn
-            .query_row(
-                "SELECT value FROM usage_meta WHERE key = 'updated_at'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-
-        let mut processed_stmt =
-            conn.prepare("SELECT file_id FROM usage_processed_files ORDER BY seq ASC")?;
-        let processed_file_ids = processed_stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        let mut records_stmt = conn.prepare(
-            "SELECT record_id, model, timestamp, timestamp_ms, total_tokens, input_tokens, output_tokens, cached_tokens, cache_creation_tokens, reasoning_tokens, failed FROM usage_records ORDER BY COALESCE(timestamp_ms, 0) ASC, record_id ASC",
-        )?;
-        let records = records_stmt
-            .query_map([], |row| {
-                Ok(PersistedUsageRecord {
-                    record_id: row.get(0)?,
-                    model: row.get(1)?,
-                    timestamp: row.get(2)?,
-                    timestamp_ms: row.get(3)?,
-                    total_tokens: row.get(4)?,
-                    input_tokens: row.get(5)?,
-                    output_tokens: row.get(6)?,
-                    cached_tokens: row.get(7)?,
-                    cache_creation_tokens: row.get(8)?,
-                    reasoning_tokens: row.get(9)?,
-                    failed: row.get::<_, i64>(10)? != 0,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        Ok(PersistedUsageState {
-            version: 2,
-            updated_at,
-            processed_file_ids,
-            records,
-        })
-    }
-
-    fn write_usage_state_to_db(
-        &self,
-        conn: &Connection,
-        state: &PersistedUsageState,
-    ) -> Result<PersistedUsageState> {
-        let mut next = state.clone();
-        next.updated_at = Some(now_iso());
-        if next.processed_file_ids.len() > MAX_USAGE_PROCESSED_FILE_IDS {
-            let keep_from = next.processed_file_ids.len() - MAX_USAGE_PROCESSED_FILE_IDS;
-            next.processed_file_ids = next.processed_file_ids[keep_from..].to_vec();
-        }
-
-        let tx = conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM usage_meta", [])?;
-        tx.execute("DELETE FROM usage_processed_files", [])?;
-        tx.execute("DELETE FROM usage_records", [])?;
-        tx.execute(
-            "INSERT INTO usage_meta (key, value) VALUES ('updated_at', ?1)",
-            params![next.updated_at.clone()],
-        )?;
-
-        for (index, file_id) in next.processed_file_ids.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO usage_processed_files (seq, file_id) VALUES (?1, ?2)",
-                params![index as i64, file_id],
-            )?;
-        }
-
-        for record in &next.records {
-            tx.execute(
-                "INSERT INTO usage_records (record_id, model, timestamp, timestamp_ms, total_tokens, input_tokens, output_tokens, cached_tokens, cache_creation_tokens, reasoning_tokens, failed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    record.record_id,
-                    record.model,
-                    record.timestamp,
-                    record.timestamp_ms,
-                    record.total_tokens,
-                    record.input_tokens,
-                    record.output_tokens,
-                    record.cached_tokens,
-                    record.cache_creation_tokens,
-                    record.reasoning_tokens,
-                    if record.failed { 1i64 } else { 0i64 },
-                ],
-            )?;
-        }
-        tx.commit()?;
-        Ok(next)
-    }
-
-    fn read_persisted_usage_state(&self) -> Result<PersistedUsageState> {
-        if let Some(cached) = self.inner.usage_state_cache.lock().unwrap().clone() {
-            return Ok(cached);
-        }
-        self.ensure_usage_database()?;
-        let conn = self.open_usage_db()?;
-        let next = self.read_usage_state_from_db(&conn)?;
-        *self.inner.usage_state_cache.lock().unwrap() = Some(next.clone());
-        Ok(next)
-    }
-
-    fn write_persisted_usage_state(&self, state: &PersistedUsageState) -> Result<()> {
-        self.ensure_usage_database()?;
-        let conn = self.open_usage_db()?;
-        let next = self.write_usage_state_to_db(&conn, state)?;
-        *self.inner.usage_state_cache.lock().unwrap() = Some(next);
-        Ok(())
-    }
-
     fn migrate_legacy_auth_files(&self) -> Result<()> {
         let install_dir = &self.inner.paths.install_dir;
         if install_dir == &self.inner.paths.base_dir {
@@ -2428,19 +2164,6 @@ impl Backend {
             &self.inner.paths.auth_dir,
         )?;
         migrate_path_if_missing(&install_dir.join("logs"), &self.inner.paths.logs_dir)?;
-
-        Ok(())
-    }
-
-    fn cleanup_legacy_usage_files(&self) -> Result<()> {
-        remove_path_if_exists(&self.inner.paths.usage_stats_path)?;
-        remove_path_if_exists(&self.inner.paths.usage_db_path)?;
-
-        let install_dir = &self.inner.paths.install_dir;
-        if install_dir != &self.inner.paths.base_dir {
-            remove_path_if_exists(&install_dir.join(USAGE_STATS_FILE_NAME))?;
-            remove_path_if_exists(&install_dir.join(USAGE_DB_FILE_NAME))?;
-        }
 
         Ok(())
     }
@@ -2530,10 +2253,6 @@ impl Backend {
               "unavailable": false,
               "createdAt": Value::Null,
               "updatedAt": Value::Null,
-              "successCount": 0,
-              "failureCount": 0,
-              "totalRequests": 0,
-              "lastUsedAt": Value::Null,
               "planType": detail.1,
               "detailItems": detail.0,
             }));
@@ -2684,13 +2403,12 @@ impl Backend {
             if let Some(payload) = remote_auth_files.as_ref() {
                 let remote_entries = extract_remote_auth_file_entries(payload);
                 let indexed = index_remote_auth_files_by_name(&remote_entries);
-                let usage_stats = HashMap::new();
                 auth_files = auth_files
                     .into_iter()
                     .map(|file| {
                         let name = read_string(file.get("name"), "").to_lowercase();
                         let remote = indexed.get(&name).cloned();
-                        merge_remote_auth_file_record(file, remote, &usage_stats)
+                        merge_remote_auth_file_record(file, remote)
                     })
                     .collect();
             }
@@ -3279,101 +2997,6 @@ impl Backend {
             "{}",
             last_error.unwrap_or_else(|| "管理接口请求失败。".to_string())
         ))
-    }
-
-    fn ingest_usage_logs_to_store(&self) -> Result<PersistedUsageState> {
-        let mut store = self.read_persisted_usage_state()?;
-        let mut existing_ids = store
-            .records
-            .iter()
-            .map(|record| record.record_id.clone())
-            .collect::<HashSet<_>>();
-        let mut processed = store
-            .processed_file_ids
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
-        let mut changed = false;
-
-        if let Ok(entries) = fs::read_dir(&self.inner.paths.logs_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or_default();
-                if !entry
-                    .file_type()
-                    .map(|file_type| file_type.is_file())
-                    .unwrap_or(false)
-                    || !is_usage_log_file_name(name)
-                {
-                    continue;
-                }
-
-                let metadata = match fs::metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(_) => continue,
-                };
-                let modified = match metadata.modified() {
-                    Ok(value) => value,
-                    Err(_) => continue,
-                };
-                let file_age = SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                if file_age < MIN_USAGE_LOG_FILE_AGE_MS {
-                    continue;
-                }
-                let file_id = build_usage_log_file_id(
-                    name,
-                    metadata.len(),
-                    system_time_to_millis(Some(modified)).unwrap_or(0),
-                );
-                if processed.contains(&file_id) {
-                    let _ = fs::remove_file(&path);
-                    continue;
-                }
-                let raw = match fs::read_to_string(&path) {
-                    Ok(raw) => raw,
-                    Err(_) => continue,
-                };
-                let record = parse_usage_log_record(
-                    name,
-                    &raw,
-                    system_time_to_millis(Some(modified)).unwrap_or(0) as i64,
-                );
-                if let Some(record) = record {
-                    if !existing_ids.contains(&file_id) {
-                        store.records.push(PersistedUsageRecord {
-                            record_id: file_id.clone(),
-                            ..record
-                        });
-                        existing_ids.insert(file_id.clone());
-                    }
-                }
-                store.processed_file_ids.push(file_id.clone());
-                processed.insert(file_id);
-                changed = true;
-                let _ = fs::remove_file(&path);
-            }
-        }
-
-        if store.processed_file_ids.len() > MAX_USAGE_PROCESSED_FILE_IDS {
-            let keep_from = store.processed_file_ids.len() - MAX_USAGE_PROCESSED_FILE_IDS;
-            store.processed_file_ids = store.processed_file_ids[keep_from..].to_vec();
-            changed = true;
-        }
-        if changed {
-            self.write_persisted_usage_state(&store)?;
-        }
-        Ok(store)
-    }
-
-    fn build_usage_summary_from_logs(&self, query: Option<&Value>) -> Result<Option<Value>> {
-        let store = self.ingest_usage_logs_to_store()?;
-        Ok(build_usage_summary_from_records(&store.records, query))
     }
 
     fn resolve_binary_path(&self, gui_state: &GuiState) -> Result<String> {
@@ -4435,8 +4058,6 @@ fn resolve_paths(app: &AppHandle) -> ResolvedPaths {
         gui_state_path: base_dir.join("gui-state.json"),
         auth_dir: base_dir.join(AUTH_DIRECTORY_NAME),
         logs_dir: base_dir.join("logs"),
-        usage_stats_path: base_dir.join(USAGE_STATS_FILE_NAME),
-        usage_db_path: base_dir.join(USAGE_DB_FILE_NAME),
         base_dir,
         install_dir,
         binary_candidates,
@@ -5393,7 +5014,6 @@ fn build_remote_auth_file_details(
 fn merge_remote_auth_file_record(
     local_record: Value,
     remote_entry: Option<Value>,
-    usage_stats_by_auth_index: &HashMap<String, AuthFileUsageStats>,
 ) -> Value {
     let Some(remote_entry) = remote_entry else {
         return local_record;
@@ -5407,11 +5027,6 @@ fn merge_remote_auth_file_record(
             .get("auth_index")
             .or_else(|| remote_entry.get("authIndex")),
     );
-    let usage = auth_index
-        .as_ref()
-        .and_then(|value| usage_stats_by_auth_index.get(value))
-        .cloned()
-        .unwrap_or_default();
     let remote_details = build_remote_auth_file_details(&remote_entry, &provider, &file_type);
     let local_details = array(local_record.get("detailItems"));
     let mut next = local_record;
@@ -5457,10 +5072,6 @@ fn merge_remote_auth_file_record(
     )
     .map(Value::String)
     .unwrap_or(Value::Null);
-    next["successCount"] = Value::Number(Number::from(usage.success_count));
-    next["failureCount"] = Value::Number(Number::from(usage.failure_count));
-    next["totalRequests"] = Value::Number(Number::from(usage.total_requests));
-    next["lastUsedAt"] = usage.last_used_at.map(Value::String).unwrap_or(Value::Null);
     next["planType"] = remote_details
         .1
         .map(Value::String)
@@ -5470,14 +5081,6 @@ fn merge_remote_auth_file_record(
         remote_details.0,
     ]));
     next
-}
-
-#[derive(Debug, Clone, Default)]
-struct AuthFileUsageStats {
-    total_requests: i64,
-    success_count: i64,
-    failure_count: i64,
-    last_used_at: Option<String>,
 }
 
 fn extract_remote_auth_file_entries(payload: &Value) -> Vec<Value> {
@@ -5507,701 +5110,6 @@ fn index_remote_auth_files_by_name(entries: &[Value]) -> HashMap<String, Value> 
         }
     }
     indexed
-}
-
-fn collect_usage_stats_by_auth_index(payload: &Value) -> HashMap<String, AuthFileUsageStats> {
-    let mut result = HashMap::new();
-    let root = payload.get("usage").unwrap_or(payload);
-    let apis = object(root.get("apis"));
-    for (_, api_entry) in apis {
-        let models = object(api_entry.get("models"));
-        for (_, model_entry) in models {
-            for detail in array(model_entry.get("details")) {
-                let Some(auth_index) = normalize_auth_index(
-                    detail.get("auth_index").or_else(|| detail.get("authIndex")),
-                ) else {
-                    continue;
-                };
-                let stats = result
-                    .entry(auth_index)
-                    .or_insert_with(AuthFileUsageStats::default);
-                let failed = read_bool(detail.get("failed"), false);
-                stats.total_requests += 1;
-                stats.success_count += if failed { 0 } else { 1 };
-                stats.failure_count += if failed { 1 } else { 0 };
-                let timestamp = normalized_string(detail.get("timestamp"));
-                if newer_iso(timestamp.clone(), stats.last_used_at.clone()) {
-                    stats.last_used_at = timestamp;
-                }
-            }
-        }
-    }
-    result
-}
-
-fn empty_usage_summary(error: Option<String>, query: Option<&Value>) -> Value {
-    let resolved = resolve_usage_summary_query(query);
-    json!({
-      "available": false,
-      "rangePreset": resolved.0,
-      "rangeLabel": resolved.1,
-      "rangeStartAt": resolved.2,
-      "rangeEndAt": resolved.3,
-      "rangeGranularity": resolved.4,
-      "usedDetailRange": false,
-      "totalRequests": 0,
-      "successCount": 0,
-      "failureCount": 0,
-      "totalTokens": 0,
-      "netTokens": 0,
-      "billableInputTokens": 0,
-      "inputTokens": 0,
-      "outputTokens": 0,
-      "cachedTokens": 0,
-      "reasoningTokens": 0,
-      "requestsByDay": [],
-      "tokensByDay": [],
-      "topModels": [],
-      "lastUpdatedAt": Value::Null,
-      "error": error,
-    })
-}
-
-fn build_usage_summary(payload: &Value, query: Option<&Value>) -> Value {
-    let resolved = resolve_usage_summary_query(query);
-    let root = if payload.get("usage").map(Value::is_object).unwrap_or(false) {
-        payload.get("usage").unwrap_or(payload)
-    } else {
-        payload
-    };
-    let apis = object(root.get("apis"));
-
-    let mut model_map = BTreeMap::<String, UsageModelSummary>::new();
-    let mut requests = BTreeMap::<String, i64>::new();
-    let mut tokens = BTreeMap::<String, i64>::new();
-    let mut total_requests = 0i64;
-    let mut success_count = 0i64;
-    let mut failure_count = 0i64;
-    let mut total_tokens = 0i64;
-    let mut net_tokens = 0i64;
-    let mut billable_input_tokens = 0i64;
-    let mut input_tokens = 0i64;
-    let mut output_tokens = 0i64;
-    let mut cached_tokens = 0i64;
-    let mut cache_creation_tokens = 0i64;
-    let mut reasoning_tokens = 0i64;
-
-    for (_, api_entry) in apis {
-        let models = object(api_entry.get("models"));
-        for (model_name, model_entry) in models {
-            let details = array(model_entry.get("details"));
-            if !details.is_empty() {
-                for detail in details {
-                    let timestamp = normalized_string(detail.get("timestamp"));
-                    let timestamp_ms = parse_usage_timestamp(timestamp.clone());
-                    if !is_usage_timestamp_within_range(timestamp_ms, &resolved) {
-                        continue;
-                    }
-                    let tokens_obj = object(detail.get("tokens"));
-                    let input = first_finite_number(&[
-                        detail.get("input_tokens"),
-                        tokens_obj.get("input_tokens"),
-                        tokens_obj.get("prompt_tokens"),
-                    ])
-                    .unwrap_or(0.0) as i64;
-                    let output = first_finite_number(&[
-                        detail.get("output_tokens"),
-                        tokens_obj.get("output_tokens"),
-                        tokens_obj.get("completion_tokens"),
-                    ])
-                    .unwrap_or(0.0) as i64;
-                    let cached = first_finite_number(&[
-                        detail.get("cached_tokens"),
-                        tokens_obj.get("cached_tokens"),
-                        tokens_obj.get("cache_tokens"),
-                        tokens_obj
-                            .get("input_tokens_details")
-                            .and_then(|value| value.get("cached_tokens")),
-                    ])
-                    .unwrap_or(0.0) as i64;
-                    let cache_creation = first_finite_number(&[
-                        detail.get("cache_creation_tokens"),
-                        detail.get("cache_creation_input_tokens"),
-                        tokens_obj.get("cache_creation_tokens"),
-                        tokens_obj.get("cache_creation_input_tokens"),
-                        tokens_obj
-                            .get("input_tokens_details")
-                            .and_then(|value| value.get("cache_creation_tokens")),
-                        tokens_obj
-                            .get("input_tokens_details")
-                            .and_then(|value| value.get("cache_creation_input_tokens")),
-                    ])
-                    .unwrap_or(0.0) as i64;
-                    let reasoning = first_finite_number(&[
-                        detail.get("reasoning_tokens"),
-                        tokens_obj.get("reasoning_tokens"),
-                        tokens_obj
-                            .get("output_tokens_details")
-                            .and_then(|value| value.get("reasoning_tokens")),
-                    ])
-                    .unwrap_or(0.0) as i64;
-                    let total = first_finite_number(&[
-                        detail.get("total_tokens"),
-                        tokens_obj.get("total_tokens"),
-                    ])
-                    .unwrap_or((input + output) as f64) as i64;
-                    let failed = read_bool(detail.get("failed"), false);
-                    let billable = (input - cached).max(0);
-                    let net = (total - cached).max(0);
-                    let model = model_map
-                        .entry(model_name.clone())
-                        .or_insert_with(|| UsageModelSummary::new(&model_name));
-                    model.requests += 1;
-                    model.success_count += if failed { 0 } else { 1 };
-                    model.failure_count += if failed { 1 } else { 0 };
-                    model.total_tokens += total;
-                    model.net_tokens += net;
-                    model.billable_input_tokens += billable;
-                    model.input_tokens += input;
-                    model.output_tokens += output;
-                    model.cached_tokens += cached;
-                    model.cache_creation_tokens += cache_creation;
-                    model.reasoning_tokens += reasoning;
-
-                    total_requests += 1;
-                    success_count += if failed { 0 } else { 1 };
-                    failure_count += if failed { 1 } else { 0 };
-                    total_tokens += total;
-                    net_tokens += net;
-                    billable_input_tokens += billable;
-                    input_tokens += input;
-                    output_tokens += output;
-                    cached_tokens += cached;
-                    cache_creation_tokens += cache_creation;
-                    reasoning_tokens += reasoning;
-                    record_usage_bucket(&mut requests, timestamp_ms, &resolved.4, 1);
-                    record_usage_bucket(&mut tokens, timestamp_ms, &resolved.4, net);
-                }
-            } else if !resolved.5 {
-                let request_count = read_number(model_entry.get("total_requests"), 0.0) as i64;
-                let success =
-                    read_number(model_entry.get("success_count"), request_count as f64) as i64;
-                let failure = read_number(model_entry.get("failure_count"), 0.0) as i64;
-                let input = first_finite_number(&[
-                    model_entry.get("input_tokens"),
-                    model_entry.get("prompt_tokens"),
-                ])
-                .unwrap_or(0.0) as i64;
-                let output = first_finite_number(&[
-                    model_entry.get("output_tokens"),
-                    model_entry.get("completion_tokens"),
-                ])
-                .unwrap_or(0.0) as i64;
-                let cached = first_finite_number(&[
-                    model_entry.get("cached_tokens"),
-                    model_entry.get("cache_tokens"),
-                    model_entry
-                        .get("input_tokens_details")
-                        .and_then(|value| value.get("cached_tokens")),
-                ])
-                .unwrap_or(0.0) as i64;
-                let cache_creation = first_finite_number(&[
-                    model_entry.get("cache_creation_tokens"),
-                    model_entry.get("cache_creation_input_tokens"),
-                    model_entry
-                        .get("input_tokens_details")
-                        .and_then(|value| value.get("cache_creation_tokens")),
-                    model_entry
-                        .get("input_tokens_details")
-                        .and_then(|value| value.get("cache_creation_input_tokens")),
-                ])
-                .unwrap_or(0.0) as i64;
-                let reasoning = first_finite_number(&[
-                    model_entry.get("reasoning_tokens"),
-                    model_entry
-                        .get("output_tokens_details")
-                        .and_then(|value| value.get("reasoning_tokens")),
-                ])
-                .unwrap_or(0.0) as i64;
-                let total = first_finite_number(&[model_entry.get("total_tokens")])
-                    .unwrap_or((input + output) as f64) as i64;
-                let billable = (input - cached).max(0);
-                let net = (total - cached).max(0);
-                let model = model_map
-                    .entry(model_name.clone())
-                    .or_insert_with(|| UsageModelSummary::new(&model_name));
-                model.requests += request_count;
-                model.success_count += success;
-                model.failure_count += failure;
-                model.total_tokens += total;
-                model.net_tokens += net;
-                model.billable_input_tokens += billable;
-                model.input_tokens += input;
-                model.output_tokens += output;
-                model.cached_tokens += cached;
-                model.cache_creation_tokens += cache_creation;
-                model.reasoning_tokens += reasoning;
-
-                total_requests += request_count;
-                success_count += success;
-                failure_count += failure;
-                total_tokens += total;
-                net_tokens += net;
-                billable_input_tokens += billable;
-                input_tokens += input;
-                output_tokens += output;
-                cached_tokens += cached;
-                cache_creation_tokens += cache_creation;
-                reasoning_tokens += reasoning;
-            }
-        }
-    }
-
-    json!({
-      "available": total_requests > 0 || total_tokens > 0 || !model_map.is_empty(),
-      "rangePreset": resolved.0,
-      "rangeLabel": resolved.1,
-      "rangeStartAt": resolved.2,
-      "rangeEndAt": resolved.3,
-      "rangeGranularity": resolved.4,
-      "usedDetailRange": !requests.is_empty() || !tokens.is_empty(),
-      "totalRequests": total_requests,
-      "successCount": success_count,
-      "failureCount": failure_count,
-      "totalTokens": total_tokens,
-      "netTokens": net_tokens,
-      "billableInputTokens": billable_input_tokens,
-      "inputTokens": input_tokens,
-      "outputTokens": output_tokens,
-      "cachedTokens": cached_tokens,
-      "cacheCreationTokens": cache_creation_tokens,
-      "reasoningTokens": reasoning_tokens,
-      "requestsByDay": usage_points_from_map(&requests),
-      "tokensByDay": usage_points_from_map(&tokens),
-      "topModels": model_map.into_values().collect::<Vec<_>>(),
-      "lastUpdatedAt": now_iso(),
-      "error": Value::Null,
-    })
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UsageModelSummary {
-    model: String,
-    requests: i64,
-    success_count: i64,
-    failure_count: i64,
-    total_tokens: i64,
-    net_tokens: i64,
-    billable_input_tokens: i64,
-    input_tokens: i64,
-    output_tokens: i64,
-    cached_tokens: i64,
-    cache_creation_tokens: i64,
-    reasoning_tokens: i64,
-}
-
-impl UsageModelSummary {
-    fn new(model: &str) -> Self {
-        Self {
-            model: model.to_string(),
-            requests: 0,
-            success_count: 0,
-            failure_count: 0,
-            total_tokens: 0,
-            net_tokens: 0,
-            billable_input_tokens: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-            cached_tokens: 0,
-            cache_creation_tokens: 0,
-            reasoning_tokens: 0,
-        }
-    }
-}
-
-fn build_usage_summary_from_records(
-    records: &[PersistedUsageRecord],
-    query: Option<&Value>,
-) -> Option<Value> {
-    if records.is_empty() {
-        return None;
-    }
-    let resolved = resolve_usage_summary_query(query);
-    let mut model_map = BTreeMap::<String, UsageModelSummary>::new();
-    let mut requests = BTreeMap::<String, i64>::new();
-    let mut tokens = BTreeMap::<String, i64>::new();
-    let mut total_requests = 0i64;
-    let mut success_count = 0i64;
-    let mut failure_count = 0i64;
-    let mut total_tokens = 0i64;
-    let mut net_tokens = 0i64;
-    let mut billable_input_tokens = 0i64;
-    let mut input_tokens = 0i64;
-    let mut output_tokens = 0i64;
-    let mut cached_tokens = 0i64;
-    let mut cache_creation_tokens = 0i64;
-    let mut reasoning_tokens = 0i64;
-    for record in records {
-        if !is_usage_timestamp_within_range(record.timestamp_ms, &resolved) {
-            continue;
-        }
-        let model = model_map
-            .entry(record.model.clone())
-            .or_insert_with(|| UsageModelSummary::new(&record.model));
-        let net = (record.total_tokens - record.cached_tokens).max(0);
-        let billable = (record.input_tokens - record.cached_tokens).max(0);
-        model.requests += 1;
-        model.success_count += if record.failed { 0 } else { 1 };
-        model.failure_count += if record.failed { 1 } else { 0 };
-        model.total_tokens += record.total_tokens;
-        model.net_tokens += net;
-        model.billable_input_tokens += billable;
-        model.input_tokens += record.input_tokens;
-        model.output_tokens += record.output_tokens;
-        model.cached_tokens += record.cached_tokens;
-        model.cache_creation_tokens += record.cache_creation_tokens;
-        model.reasoning_tokens += record.reasoning_tokens;
-
-        total_requests += 1;
-        success_count += if record.failed { 0 } else { 1 };
-        failure_count += if record.failed { 1 } else { 0 };
-        total_tokens += record.total_tokens;
-        net_tokens += net;
-        billable_input_tokens += billable;
-        input_tokens += record.input_tokens;
-        output_tokens += record.output_tokens;
-        cached_tokens += record.cached_tokens;
-        cache_creation_tokens += record.cache_creation_tokens;
-        reasoning_tokens += record.reasoning_tokens;
-        record_usage_bucket(&mut requests, record.timestamp_ms, &resolved.4, 1);
-        record_usage_bucket(&mut tokens, record.timestamp_ms, &resolved.4, net);
-    }
-    if total_requests == 0 {
-        return None;
-    }
-    Some(json!({
-      "available": true,
-      "rangePreset": resolved.0,
-      "rangeLabel": resolved.1,
-      "rangeStartAt": resolved.2,
-      "rangeEndAt": resolved.3,
-      "rangeGranularity": resolved.4,
-      "usedDetailRange": true,
-      "totalRequests": total_requests,
-      "successCount": success_count,
-      "failureCount": failure_count,
-      "totalTokens": total_tokens,
-      "netTokens": net_tokens,
-      "billableInputTokens": billable_input_tokens,
-      "inputTokens": input_tokens,
-      "outputTokens": output_tokens,
-      "cachedTokens": cached_tokens,
-      "cacheCreationTokens": cache_creation_tokens,
-      "reasoningTokens": reasoning_tokens,
-      "requestsByDay": usage_points_from_map(&requests),
-      "tokensByDay": usage_points_from_map(&tokens),
-      "topModels": model_map.into_values().collect::<Vec<_>>(),
-      "lastUpdatedAt": now_iso(),
-      "error": Value::Null,
-    }))
-}
-
-fn should_use_usage_log_fallback(summary: &Value) -> bool {
-    !read_bool(summary.get("available"), false)
-        || (read_number(summary.get("totalRequests"), 0.0) <= 0.0
-            && read_number(summary.get("totalTokens"), 0.0) <= 0.0
-            && array(summary.get("topModels")).is_empty())
-}
-
-fn resolve_usage_summary_query(
-    query: Option<&Value>,
-) -> (String, String, Option<String>, Option<String>, String, bool) {
-    let preset = read_string(query.and_then(|value| value.get("preset")), "all");
-    let now = Utc::now();
-    match preset.as_str() {
-        "24h" => (
-            "24h".to_string(),
-            "近 24 小时".to_string(),
-            Some((now - chrono::Duration::hours(24)).to_rfc3339()),
-            Some(now.to_rfc3339()),
-            "hour".to_string(),
-            true,
-        ),
-        "7d" => (
-            "7d".to_string(),
-            "近 7 天".to_string(),
-            Some((now - chrono::Duration::days(7)).to_rfc3339()),
-            Some(now.to_rfc3339()),
-            "day".to_string(),
-            true,
-        ),
-        "30d" => (
-            "30d".to_string(),
-            "近 30 天".to_string(),
-            Some((now - chrono::Duration::days(30)).to_rfc3339()),
-            Some(now.to_rfc3339()),
-            "day".to_string(),
-            true,
-        ),
-        "custom" => {
-            let start = parse_usage_timestamp(normalized_string(
-                query.and_then(|value| value.get("startAt")),
-            ))
-            .map(timestamp_ms_to_iso);
-            let end = parse_usage_timestamp(normalized_string(
-                query.and_then(|value| value.get("endAt")),
-            ))
-            .map(timestamp_ms_to_iso);
-            let duration = start
-                .as_ref()
-                .zip(end.as_ref())
-                .and_then(|(start, end)| {
-                    parse_usage_timestamp(Some(start.clone()))
-                        .zip(parse_usage_timestamp(Some(end.clone())))
-                })
-                .map(|(start, end)| end - start);
-            (
-                "custom".to_string(),
-                "自定义时间段".to_string(),
-                start,
-                end,
-                if duration.unwrap_or(i64::MAX) <= 48 * 60 * 60 * 1000 {
-                    "hour".to_string()
-                } else {
-                    "day".to_string()
-                },
-                true,
-            )
-        }
-        _ => (
-            "all".to_string(),
-            "全部时间".to_string(),
-            None,
-            None,
-            "day".to_string(),
-            false,
-        ),
-    }
-}
-
-fn is_usage_timestamp_within_range(
-    timestamp_ms: Option<i64>,
-    resolved: &(String, String, Option<String>, Option<String>, String, bool),
-) -> bool {
-    if !resolved.5 {
-        return true;
-    }
-    let Some(timestamp_ms) = timestamp_ms else {
-        return false;
-    };
-    if let Some(start) = resolved
-        .2
-        .as_ref()
-        .and_then(|value| parse_usage_timestamp(Some(value.clone())))
-    {
-        if timestamp_ms < start {
-            return false;
-        }
-    }
-    if let Some(end) = resolved
-        .3
-        .as_ref()
-        .and_then(|value| parse_usage_timestamp(Some(value.clone())))
-    {
-        if timestamp_ms > end {
-            return false;
-        }
-    }
-    true
-}
-
-fn record_usage_bucket(
-    buckets: &mut BTreeMap<String, i64>,
-    timestamp_ms: Option<i64>,
-    granularity: &str,
-    amount: i64,
-) {
-    let Some(timestamp_ms) = timestamp_ms else {
-        return;
-    };
-    let label = format_usage_bucket_label(timestamp_ms, granularity);
-    *buckets.entry(label).or_insert(0) += amount;
-}
-
-fn usage_points_from_map(map: &BTreeMap<String, i64>) -> Vec<Value> {
-    map.iter()
-        .map(|(label, value)| json!({ "label": label, "value": value }))
-        .collect()
-}
-
-fn is_usage_log_file_name(file_name: &str) -> bool {
-    file_name.starts_with("v1-responses-")
-        || file_name.starts_with("v1-chat-completions-")
-        || file_name.starts_with("v1-completions-")
-        || file_name.starts_with("v1-models-")
-}
-
-fn build_usage_log_file_id(file_name: &str, size: u64, mtime_ms: u64) -> String {
-    format!("{file_name}:{size}:{mtime_ms}")
-}
-
-fn parse_usage_log_record(
-    file_name: &str,
-    raw: &str,
-    fallback_timestamp_ms: i64,
-) -> Option<PersistedUsageRecord> {
-    let timestamp = parse_usage_log_timestamp(raw, fallback_timestamp_ms);
-    let request_payload = parse_usage_log_request_payload(raw);
-    let response_body = extract_usage_log_response_body(raw)?;
-    let mut usage_payload = None::<Value>;
-    let mut model =
-        normalized_string(request_payload.get("model")).unwrap_or_else(|| "unknown".to_string());
-    let mut failed = false;
-
-    if file_name.starts_with("v1-responses-") {
-        let lines = response_body.lines().collect::<Vec<_>>();
-        for (index, line) in lines.iter().enumerate() {
-            if line.trim() != "event: response.completed" {
-                continue;
-            }
-            let payload =
-                parse_usage_log_json_line(lines.get(index + 1).copied().unwrap_or_default())?;
-            let response = object(payload.get("response"));
-            let usage = response.get("usage").cloned().unwrap_or(Value::Null);
-            if usage.is_object() {
-                usage_payload = Some(usage);
-                model = normalized_string(response.get("model")).unwrap_or(model);
-                failed = read_bool(response.get("failed"), false)
-                    || response.get("error").map(Value::is_object).unwrap_or(false)
-                    || read_string(response.get("status"), "").to_lowercase() == "failed";
-            }
-        }
-    } else {
-        if response_body.trim_start().starts_with('{') {
-            if let Ok(payload) = serde_json::from_str::<Value>(response_body.trim()) {
-                if payload.get("usage").map(Value::is_object).unwrap_or(false) {
-                    usage_payload = payload.get("usage").cloned();
-                    model = normalized_string(payload.get("model")).unwrap_or(model);
-                    failed = payload.get("error").map(Value::is_object).unwrap_or(false);
-                }
-            }
-        }
-        if usage_payload.is_none() {
-            for line in response_body.lines() {
-                if let Some(payload) = parse_usage_log_json_line(line) {
-                    if payload.get("usage").map(Value::is_object).unwrap_or(false) {
-                        usage_payload = payload.get("usage").cloned();
-                        model = normalized_string(payload.get("model")).unwrap_or(model);
-                        failed =
-                            failed || payload.get("error").map(Value::is_object).unwrap_or(false);
-                    }
-                }
-            }
-        }
-    }
-
-    let usage_payload = usage_payload?;
-    let input = first_finite_number(&[
-        usage_payload.get("input_tokens"),
-        usage_payload.get("prompt_tokens"),
-    ])
-    .unwrap_or(0.0) as i64;
-    let output = first_finite_number(&[
-        usage_payload.get("output_tokens"),
-        usage_payload.get("completion_tokens"),
-    ])
-    .unwrap_or(0.0) as i64;
-    let cached = first_finite_number(&[
-        usage_payload.get("cached_tokens"),
-        usage_payload.get("cache_tokens"),
-        usage_payload
-            .get("input_tokens_details")
-            .and_then(|value| value.get("cached_tokens")),
-    ])
-    .unwrap_or(0.0) as i64;
-    let cache_creation = first_finite_number(&[
-        usage_payload.get("cache_creation_tokens"),
-        usage_payload.get("cache_creation_input_tokens"),
-        usage_payload
-            .get("input_tokens_details")
-            .and_then(|value| value.get("cache_creation_tokens")),
-        usage_payload
-            .get("input_tokens_details")
-            .and_then(|value| value.get("cache_creation_input_tokens")),
-    ])
-    .unwrap_or(0.0) as i64;
-    let reasoning = first_finite_number(&[
-        usage_payload.get("reasoning_tokens"),
-        usage_payload
-            .get("output_tokens_details")
-            .and_then(|value| value.get("reasoning_tokens")),
-    ])
-    .unwrap_or(0.0) as i64;
-    let total = first_finite_number(&[usage_payload.get("total_tokens")])
-        .unwrap_or((input + output) as f64) as i64;
-    Some(PersistedUsageRecord {
-        record_id: String::new(),
-        model,
-        timestamp: Some(timestamp.clone()),
-        timestamp_ms: parse_usage_timestamp(Some(timestamp)),
-        total_tokens: total,
-        input_tokens: input,
-        output_tokens: output,
-        cached_tokens: cached,
-        cache_creation_tokens: cache_creation,
-        reasoning_tokens: reasoning,
-        failed,
-    })
-}
-
-fn parse_usage_log_json_line(line: &str) -> Option<Value> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with("data: ") {
-        return None;
-    }
-    let payload = trimmed.trim_start_matches("data: ").trim();
-    if payload.is_empty() || payload == "[DONE]" {
-        return None;
-    }
-    serde_json::from_str(payload).ok()
-}
-
-fn extract_usage_log_response_body(raw: &str) -> Option<&str> {
-    let response_section = extract_usage_log_section(raw, "=== RESPONSE ===", None)?;
-    let marker = "Body:\n";
-    response_section
-        .find(marker)
-        .map(|index| &response_section[index + marker.len()..])
-}
-
-fn parse_usage_log_timestamp(raw: &str, fallback_timestamp_ms: i64) -> String {
-    raw.lines()
-        .find_map(|line| line.strip_prefix("Timestamp:").map(str::trim))
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| timestamp_ms_to_iso(fallback_timestamp_ms))
-}
-
-fn parse_usage_log_request_payload(raw: &str) -> Value {
-    extract_usage_log_section(raw, "=== REQUEST BODY ===", Some("=== RESPONSE ==="))
-        .and_then(|section| serde_json::from_str(section).ok())
-        .unwrap_or_else(|| json!({}))
-}
-
-fn extract_usage_log_section<'a>(
-    raw: &'a str,
-    start_marker: &str,
-    end_marker: Option<&str>,
-) -> Option<&'a str> {
-    let start_index = raw.find(start_marker)?;
-    let content_start = start_index + start_marker.len();
-    let end_index = end_marker.and_then(|marker| {
-        raw[content_start..]
-            .find(marker)
-            .map(|offset| content_start + offset)
-    });
-    Some(raw[content_start..end_index.unwrap_or(raw.len())].trim())
 }
 
 fn fetch_release_asset_descriptor_for_channel(
@@ -7441,10 +6349,6 @@ mod tests {
             "unavailable": false,
             "createdAt": Value::Null,
             "updatedAt": Value::Null,
-            "successCount": 0,
-            "failureCount": 0,
-            "totalRequests": 0,
-            "lastUsedAt": Value::Null,
             "planType": Value::Null,
             "detailItems": [
                 { "label": "文件类型", "value": "codex" },
@@ -7464,24 +6368,13 @@ mod tests {
             "email": "remote@example.com",
             "updated_at": "2026-04-11T01:00:00.000Z"
         });
-        let usage_stats = HashMap::from([(
-            "17".to_string(),
-            AuthFileUsageStats {
-                total_requests: 9,
-                success_count: 8,
-                failure_count: 1,
-                last_used_at: Some("2026-04-11T02:00:00.000Z".to_string()),
-            },
-        )]);
-
-        let merged = merge_remote_auth_file_record(local_record, Some(remote_entry), &usage_stats);
+        let merged = merge_remote_auth_file_record(local_record, Some(remote_entry));
         let detail_items = array(merged.get("detailItems"));
 
         assert_eq!(read_string(merged.get("authIndex"), ""), "17");
         assert_eq!(read_string(merged.get("planType"), ""), "plus");
         assert_eq!(read_string(merged.get("status"), ""), "ready");
         assert_eq!(read_string(merged.get("statusMessage"), ""), "ok");
-        assert_eq!(merged.get("totalRequests").and_then(Value::as_i64), Some(9));
         assert!(detail_items.iter().any(|item| {
             read_string(item.get("label"), "") == "邮箱"
                 && read_string(item.get("value"), "") == "local@example.com"
@@ -8463,18 +7356,6 @@ fn parse_usage_timestamp(value: Option<String>) -> Option<i64> {
         })
 }
 
-fn format_usage_bucket_label(timestamp_ms: i64, granularity: &str) -> String {
-    let date_time = Utc
-        .timestamp_millis_opt(timestamp_ms)
-        .single()
-        .unwrap_or_else(Utc::now);
-    if granularity == "hour" {
-        date_time.format("%m/%d %H:00").to_string()
-    } else {
-        date_time.format("%m/%d").to_string()
-    }
-}
-
 fn normalize_yaml_path(input_path: &Path) -> String {
     input_path.to_string_lossy().replace('\\', "/")
 }
@@ -8590,13 +7471,6 @@ fn normalized_quota_fraction(value: Option<&Value>) -> Option<f64> {
 
 fn normalize_auth_index(value: Option<&Value>) -> Option<String> {
     normalized_string(value)
-}
-
-fn first_finite_number(values: &[Option<&Value>]) -> Option<f64> {
-    values
-        .iter()
-        .filter_map(|value| normalized_number(*value))
-        .find(|value| value.is_finite())
 }
 
 fn dedupe_strings(values: &[Option<String>]) -> Vec<String> {
